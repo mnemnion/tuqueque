@@ -52,15 +52,15 @@
 
 pub const EnqueueToken = packed struct(u64) {
     index: u1, // Which queue is writing
-    capacity: u62, // Remaining capacity of that queue
+    capacity_remaining: u62, // Remaining capacity of that queue
     closed: bool, // The queue as a whole is closed
 
-    const LOCK_MASK = (EnqueueToken{ .index = 0, .capacity = 0, .closed = true }).toWord();
+    const LOCK_MASK = (EnqueueToken{ .index = 0, .capacity_remaining = 0, .closed = true }).toWord();
 
     /// Create a new EnqueueToken of the provided capacity.  The index is 0,
     /// and it is closed.
     pub fn new(capacity: u64) EnqueueToken {
-        return .{ .index = 0, .capacity = @truncate(capacity), .closed = true };
+        return .{ .index = 0, .capacity_remaining = @truncate(capacity), .closed = true };
     }
 
     pub fn fromWord(word: u64) EnqueueToken {
@@ -81,10 +81,10 @@ pub const EnqueueToken = packed struct(u64) {
     // Try to reserve 'slots' in the queue.  If that much is available, it is
     // returned.
     pub fn tryReserve(e_state: EnqueueToken, slots: u64) ?EnqueueToken {
-        if (slots > e_state.capacity) return null;
+        if (slots > e_state.capacity_remaining) return null;
         return .{
             .closed = e_state.closed,
-            .capacity = e_state.capacity - slots,
+            .capacity_remaining = e_state.capacity_remaining - slots,
             .index = e_state.index,
         };
     }
@@ -94,7 +94,7 @@ pub const EnqueueToken = packed struct(u64) {
     pub fn reserveUpTo(e_state: EnqueueToken, slots: u64) EnqueueToken {
         return .{
             .closed = e_state.closed,
-            .capacity = if (e_state.capcity > slots) e_state.capacity - slots else 0,
+            .capacity_remaining = if (e_state.capcity > slots) e_state.capacity_remaining - slots else 0,
             .index = e_state.index,
         };
     }
@@ -111,12 +111,21 @@ pub const EnqueueToken = packed struct(u64) {
 };
 
 pub const DequeueToken = packed struct(u64) {
+    /// Which index is the dequeue
     index: u1,
-    capacity: u62,
+    /// How much is _not_ dequeued (up to capacity)
+    length: u62,
     _: u1 = 0,
 
-    pub fn new(capacity: usize) DequeueToken {
-        return .{ .index = 1, .capacity = @intCast(capacity) };
+    /// Create a new DequeueToken.
+    pub fn new() DequeueToken {
+        return .{ .index = 1, .length = 0 };
+    }
+
+    pub fn swapIndex(dq: DequeueToken) DequeueToken {
+        var new_dq = dq;
+        new_dq.index +%= 1;
+        return new_dq;
     }
 
     // TODO: umax lock guard?
@@ -140,12 +149,25 @@ pub fn CachePad(T: type) type {
 
         const CPad = @This();
 
-        pub fn get(padded: *CPad) *T {
+        /// Obtain a pointer to the raw address
+        pub fn getPtr(padded: *CPad) *T {
             return &padded.raw;
         }
 
+        /// Atomically load the padded value using the indicated order.
         pub fn load(padded: *const CPad, order: AtomicOrder) T {
             return @atomicLoad(T, &padded.raw, order);
+        }
+
+        /// Atomically store a new value with the indicated order.
+        pub fn store(padded: *CPad, val: T, order: AtomicOrder) void {
+            @atomicStore(T, &padded.raw, val, order);
+        }
+
+        /// Swap in a new value using the indicated atomic order, returning
+        /// the old one.
+        pub fn swap(padded: *CPad, new: T, order: AtomicOrder) T {
+            return @atomicRmw(T, &padded.raw, .Xchg, new, order);
         }
     };
 }
@@ -168,6 +190,7 @@ pub const Notifier = struct {
         return .{ .mut = .{}, .cond = .{} };
     }
 
+    /// Notify any waiters that it's their turn.
     pub fn notify(note: *Notifier) void {
         // Sequence the mutex:
         note.mut.lock();
@@ -185,6 +208,7 @@ pub const Notifier = struct {
         note.cond.broadcast();
     }
 
+    /// Await a notification.
     pub fn wait(note: *Notifier) void {
         // Acquire the mutex:
         note.mut.lock();
@@ -194,6 +218,8 @@ pub const Notifier = struct {
         note.cond.wait(&note.mut);
     }
 
+    /// Await a notification for more-or-less `timeout_ns`.  When
+    /// the thread actually awakens is out of our hands.
     pub fn timedWait(note: *Notifier, timeout_ns: usize) void {
         // Acquire the mutex:
         note.mut.lock();
@@ -264,21 +290,24 @@ pub const NotificationKind = enum {
     }
 };
 
+/// Define a swap-buffer queue.  Capacity must be an even number, one-half of
+/// which is available for writing at any given moment.  Specify whether you
+/// want notifiers for the reader, the writers, both, or neither.
 pub fn TuQueQue(
     Cell: type,
-    comptime capacity: usize,
+    comptime total_capacity: usize,
     comptime notify: NotificationKind,
 ) type {
     // Sanity checks:
-    if (capacity & 1 == capacity)
+    if (total_capacity & 1 == total_capacity)
         @compileError("Queue capacity is a total capacity, and must be an even number");
-    if (capacity > std.math.maxInt(u63))
+    if (total_capacity > std.math.maxInt(u63))
         @compileError("Not only is this amount of memory unavailable for purchase, we cannot represent it");
 
-    const queue_bytes = alignSizeTo(@sizeOf(Cell) * (capacity >> 1), cache_line);
+    const queue_bytes = alignSizeTo(@sizeOf(Cell) * (total_capacity >> 1), cache_line);
     _ = queue_bytes;
 
-    const half_cap = capacity >> 1;
+    const half_cap = total_capacity >> 1;
 
     return struct {
         enqueue: CachePad(EnqueueToken),
@@ -304,8 +333,8 @@ pub fn TuQueQue(
             const q = try allocator.create(Queue);
             errdefer allocator.destroy(q);
             q.enqueue = EnqueueToken.new(half_cap);
-            q.dequeue = DequeueToken.new(half_cap);
-            q.lengths[0].get().* = 0;
+            q.dequeue = DequeueToken.new();
+            q.lengths[0].getPtr().* = 0;
             q.lenghts[1].get().* = 0;
             q.reader_notify = if (reader_notified) Notifier.new() else {};
             q.writer_notify = if (writer_notified) Notifier.new() else {};
@@ -327,25 +356,10 @@ pub fn TuQueQue(
         /// If the queue is closed for writes, this will open it.  Otherwise
         /// it will have no effect.
         pub fn open(q: *Queue) void {
-            // When used correctly, a closed queue will never have contention
-            // during opening.  So we don't go to any great effort to do backoff
-            // or anything like that here.
-            while (true) {
-                const n_queue_now = q.enqueue.load(.acquire);
-                var n_queue_next = n_queue_now;
-                n_queue_next.closed = false;
-                if (@cmpxchgWeak(
-                    EnqueueToken,
-                    q.enqueue.get(),
-                    n_queue_now,
-                    n_queue_next,
-                    .acq_rel,
-                    .monotonic,
-                )) |_| {
-                    spinLoopHint();
-                    continue;
-                }
-                break;
+            q.enqueue.getPtr().open(.acq_rel);
+            // Plausible someone might have seen us closed and waited:
+            if (comptime writer_notified) {
+                q.writer_notify.notify();
             }
         }
 
@@ -353,34 +367,7 @@ pub fn TuQueQue(
         /// in the write queue, but no new writes will succeed after this
         /// returns.
         pub fn close(q: *Queue) void {
-            // We're contending this time, but it's just the one word,
-            // so we do get there eventually.  But we'll do backoff.
-            var backoff: u9 = 1;
-            while (true) {
-                const n_queue_now = q.enqueue.load(.acquire);
-                var n_queue_next = n_queue_now;
-                n_queue_next.closed = true;
-                if (@cmpxchgWeak(
-                    EnqueueToken,
-                    q.enqueue.get(),
-                    n_queue_now,
-                    n_queue_next,
-                    .acq_rel,
-                    .monotonic,
-                )) |_| {
-                    // Liveness: one reader, and writers reduce capacity each
-                    // time we (non-spuriously) fail the CAS.  So at our
-                    // unluckiest the queue will be fully reserved at some
-                    // point.
-                    for (0..backoff) |_| {
-                        spinLoopHint();
-                    }
-                    backoff *%= 2;
-                    if (backoff == 0) backoff = 1;
-                    continue;
-                }
-                break;
-            }
+            q.enqueue.getPtr().close(.acq_rel);
             if (comptime writer_notified) {
                 // This is the only time we send a broadcast, because we might
                 // be freeing the queue, and hopefully a bunch of stuck writers
@@ -388,6 +375,61 @@ pub fn TuQueQue(
                 // invalidated.
                 q.writer_notify.notifyAll();
             }
+        }
+
+        /// Try a dequeue-and-swap.  This can be called whether or not the
+        /// last one timed out.  It returns `null` if there are no writes to read,
+        /// or `error.TimedOut` if we spun for too long waiting; otherwise, it
+        /// returns the message-containing slice from the queue.
+        pub fn tryDequeue(q: *Queue) !?[]Cell {
+            // TODO: only reason to do atomics at all on the dequeue is to put in a
+            // lock-guard, which only matters if user code spuriously creates multiple
+            // readers.  Pick a lane.
+            const dq_tok = q.dequeue.load(.acquire);
+            if (dq_tok.length > 0) {
+                // This means we left something in the dequeue.  The canonical reason
+                // this might happen is that we timed out on a previous try.
+                // We handle this case later, for the rest of this function, we assume
+                // it's handled: the dequeue is empty and ready to swap in.
+            }
+            // Get the capacity (resizing means this can change from half_cap).
+            // This 'side' is never contended, and only we can change it, so no
+            // atomic ordering is needed.
+            const next_capacity = q.queues[dq_tok.index].len;
+            const next_enqueue: EnqueueToken = .{ .index = dq_tok.index, .capacity_remaining = next_capacity, .closed = false };
+            const this_enqueue = q.enqueue.swap(next_enqueue, .acq_rel);
+            // Sanity check: we actually swapped the index
+            assert(this_enqueue.index != dq_tok.index);
+            const this_capacity = q.queues[this_enqueue.index].len;
+            // Our capacity remaining must be less than the total capacity of the slice
+            assert(this_capacity >= this_enqueue.capacity_remaining);
+            // length + remaining_capacity == capacity when all writes are committed
+            const this_len = q.lengths[this_enqueue.index].load(.acquire);
+            if (this_len + this_enqueue.capacity_remaining < this_capacity) {
+                // We have some writes in-flight, deal with it
+                // TODO: deal with it
+            } else {
+                // We may take our slice, but first, commit the dequeue state
+                const new_dq: DequeueToken = .{ .index = this_enqueue.index, .length = 0 };
+                q.dequeue.store(new_dq, .release);
+                // After all that, it's possible there were no writes.  If so, this was all
+                // very fast and the swap doesn't matter one way or the other, we just:
+                if (this_len == 0) {
+                    return null;
+                } else {
+                    // `this_enqueue.index` is now officially our dequeue index:
+                    return q.queues[this_enqueue.index][0..this_len];
+                }
+            }
+        }
+
+        pub fn tryEnqueueOne(q: *Queue, val: Cell) !void {
+            const v_slice: [1]Cell = .{val};
+            return q.tryEnqueueSlice(q, &v_slice);
+        }
+
+        pub fn tryEnqueueSlice(q: *Queue, vals: []Cell) !void {
+            _ = .{ q, vals };
         }
     };
 }
@@ -408,7 +450,7 @@ test "pointer casting" {
     const u_p: *EnqueueToken = @ptrCast(@alignCast(&u_q));
     u_q += 1;
     try expectEqual(0, u_p.index);
-    try expectEqual(1, u_p.capacity);
+    try expectEqual(1, u_p.capacity_remaining);
     const up_now = u_p;
     u_p.close(.monotonic);
     try expect(u_p.closed);
