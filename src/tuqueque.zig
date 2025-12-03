@@ -2,9 +2,9 @@
 //!
 //! This implements a lock-free, fallible MPSC queue of fixed size.  Lock-free
 //! means that writes and reads both proceed without the use of a Mutex, or
-//! any other lock of indefinite duration.  Fallible means that writes and
-//! dequeues can both fail.  MPSC is multiple producer, single consumer:
-//! many writers and only one reader.  Fixed size is why writes can fail.
+//! any other lock of indefinite duration.  Fallible means that enqueues and
+//! dequeues can both fail.  MPSC is multiple producer, single consumer: many
+//! writers and only one reader.  Fixed size is why writes can fail.
 //!
 //! Writers contend for updates of a single atomic value, after which they can
 //! write, unless that half of the queue is full.  Readers swap the buffer using
@@ -15,21 +15,24 @@
 //!
 //! A `TuQueQue` can be equipped with notifying capability for the reader,
 //! for writers, both, or neither.  Reader-notify provides a variation on the
-//! dequeue function, which always succeeds, but may sleep the thread.
+//! dequeue function, which always succeeds, but may sleep the thread.  Most
+//! users will find the reader-notified variation the most useful of the four.
 //!
-//! Writer-notify is provided as a thread handle, but no automatic
+//! Writer-notify is provided as a raw `Notify` type, but no automatic
 //! block-on-full is provided: user code is expected to obtain this handle,
 //! catch the error, and do something appropriate.  This can implement some
 //! nice producer/consumer SPSC patterns, which is the reason the affordance
 //! is available.  While it can also be used to manage a wait queue, that
 //! is probably not the best use of this data structure, and an automatic
 //! block-on-full using a simple `Condition` would produce a thundering-herd
-//! effect when the queue is swapped, hence, no such feature is included.
+//! effect when the queue is swapped.  Hence, no such feature is included.
 //!
 //! Once allocated, the `TuQueQue` does not need an `Allocator`, but the reader
 //! is able to grow the halves of the queue, one at a time, if needed.  Use the
 //! API for this, please, the process is fairly involved, and that way `destroy`
 //! can properly free memory even in the event that this has happened.
+//!
+//! TODO: guess I should provide an API for that, huh.
 //!
 //! The main thing to be aware of is that, at any given time, only half of the
 //! capacity is available to the writer at once.  The upside is that the reader
@@ -49,6 +52,41 @@
 //! https://crates.io/crates/swap-buffer-queue
 //!
 //! Thanks @wyfo!
+//!
+//! ## Notes on Correct Use
+//!
+//! The most important invariant is that this is a single-consumer queue.  The
+//! queue itself is assumed to be owned by the reader, that reader must live on
+//! exactly one thread at any given point.  To facilitate this, writes should
+//! come from a `WriteHandle`, this is an erased pointer to the queue which
+//! provides only enqueuing functions.  There is also a dequeue lock which
+//! prevents reader-side reëntrance: if you see a `LockedDequeue` error, that's
+//! a correctness problem with your program.
+//!
+//! There are several ways a queue can get into an inconsistent state through
+//! multithreaded use of the reader-side, not all of which are guarded against
+//! by the implementation.
+//!
+//! A successful dequeue returns a slice of the buffer, and this slice is only
+//! valid until another dequeue is attempted.  However, unusued portions of
+//! the slice can be returned with `requeueFromIndex`, and the next successful
+//! dequeue will give that back.  You'll either want to call a requeue at most
+//! once per dequeue, or thoroughly understand what it does, and I suggest the
+//! former.
+//!
+//! The queue must be opened in order to write to it, conversely, writers will
+//! see an error writing to a closed queue.  However, the 'closed bit' lives on
+//! the queue, so a writer trying to write to a _destroyed_ queue has committed
+//! illegal behavior.  Correct user code must provide some mechanism for the
+//! reader and the writers to agree on when the queue will be destroyed.
+//!
+//! This library will panic if an attempt to destroy an open queue is made.
+//! Always close the queue before destroying it.  Note that a closed queue is
+//! closed to _new_ writes, but may have active writes incoming, so the reader
+//! might have to pull several times before getting a `null` result: a closed
+//! queue returning `null` will not have additional writes unless reopened, but
+//! of course this does nothing to prevent threads from trying (see the prior
+//! paragraph).
 
 pub const EnqueueToken = packed struct(u64) {
     index: u1, // Which queue is writing
@@ -99,14 +137,14 @@ pub const EnqueueToken = packed struct(u64) {
         };
     }
 
-    pub fn close(e_state: *EnqueueToken, comptime order: AtomicOrder) void {
+    pub fn close(e_state: *EnqueueToken, comptime atomic_order: AtomicOrder) void {
         const uptr: *u64 = @ptrCast(@alignCast(e_state));
-        _ = @atomicRmw(u64, uptr, .Or, LOCK_MASK, order);
+        _ = @atomicRmw(u64, uptr, .Or, LOCK_MASK, atomic_order);
     }
 
-    pub fn reopen(e_state: *EnqueueToken, comptime order: AtomicOrder) void {
+    pub fn reopen(e_state: *EnqueueToken, comptime atomic_order: AtomicOrder) void {
         const uptr: *u64 = @ptrCast(@alignCast(e_state));
-        _ = @atomicRmw(u64, uptr, .And, ~LOCK_MASK, order);
+        _ = @atomicRmw(u64, uptr, .And, ~LOCK_MASK, atomic_order);
     }
 };
 
@@ -114,28 +152,19 @@ pub const DequeueToken = packed struct(u64) {
     /// Which index is the dequeue
     index: u1,
     /// How much is _not_ dequeued (up to capacity)
-    length: u62,
+    length_remaining: u62,
     _: u1 = 0,
+
+    pub const DEQUEUE_LOCK: DequeueToken = @bitCast(std.math.maxInt(u64));
 
     /// Create a new DequeueToken.
     pub fn new() DequeueToken {
-        return .{ .index = 1, .length = 0 };
+        return .{ .index = 1, .length_remaining = 0 };
     }
 
-    pub fn swapIndex(dq: DequeueToken) DequeueToken {
-        var new_dq = dq;
-        new_dq.index +%= 1;
-        return new_dq;
-    }
-
-    // TODO: umax lock guard?
-
-    pub fn fromWord(word: u64) DequeueToken {
-        return @bitCast(word);
-    }
-
-    pub fn toWord(e_state: DequeueToken) u64 {
-        return @bitCast(e_state);
+    pub fn getUnlocked(dqt: DequeueToken) error{LockedDequeue}!DequeueToken {
+        if (dqt == DEQUEUE_LOCK) return error.LockedDequeue;
+        return dqt;
     }
 };
 
@@ -155,19 +184,19 @@ pub fn CachePad(T: type) type {
         }
 
         /// Atomically load the padded value using the indicated order.
-        pub fn load(padded: *const CPad, order: AtomicOrder) T {
-            return @atomicLoad(T, &padded.raw, order);
+        pub fn load(padded: *const CPad, atom_order: AtomicOrder) T {
+            return @atomicLoad(T, &padded.raw, atom_order);
         }
 
         /// Atomically store a new value with the indicated order.
-        pub fn store(padded: *CPad, val: T, order: AtomicOrder) void {
-            @atomicStore(T, &padded.raw, val, order);
+        pub fn store(padded: *CPad, val: T, atom_order: AtomicOrder) void {
+            @atomicStore(T, &padded.raw, val, atom_order);
         }
 
         /// Swap in a new value using the indicated atomic order, returning
         /// the old one.
-        pub fn swap(padded: *CPad, new: T, order: AtomicOrder) T {
-            return @atomicRmw(T, &padded.raw, .Xchg, new, order);
+        pub fn swap(padded: *CPad, new: T, atom_order: AtomicOrder) T {
+            return @atomicRmw(T, &padded.raw, .Xchg, new, atom_order);
         }
     };
 }
@@ -181,7 +210,8 @@ fn alignSizeTo(size: usize, pow_2: usize) usize {
     return (size + mask) & ~mask;
 }
 
-/// A Mutex and associated Condition.
+/// A Mutex and associated Condition.  This has value semantics,
+/// copies will do the same thing as the original.
 pub const Notifier = struct {
     mut: Mutex,
     cond: Condition,
@@ -228,20 +258,18 @@ pub const Notifier = struct {
         // Drop and wait for signal or timeout
         note.cond.timedWait(&note.mut, timeout_ns);
     }
-
-    // TODO: opaque 'Waiter' type
 };
 
 //| TuQueQue
 //|
 //| The principle is very simple.  We have two buffers (slices) and two lengths,
 //| plus the EnqueueToken and the DequeueToken.  Enqueuing tries to reserve some
-//| space on a copy of the master EnqueueToken, then swaps it in, once that
+//| space on a copy of the master EnqueueToken, then swaps it in.  Once that
 //| works, the tracked capacity is smaller, but the length doesn't reflect this.
 //| When the writer is done, they atomic-add the length.  This lets writers
 //| 'leapfrog' each other.
 //|
-//| Ignoring the dequeue logic which allows non-empty buffers to be returned,
+//| Ignoring the dequeue logic which allows non-empty buffers to be requeued,
 //| when the reader wants another queue, they atomic-swap the index.  Now all
 //| new writers are on the just-drained queue, but the enqueue might have
 //| writers when we swap, we wait around for awhile for them to finish and if it
@@ -291,7 +319,7 @@ pub const NotificationKind = enum {
 };
 
 /// Errors which could be returned if a write fails
-pub const EnqueueErrorSet = error{
+const EnqueueErrorSet = error{
     /// No one can write to the queue
     QueueIsClosed,
     /// There is no room left in the (half) queue at all
@@ -300,40 +328,75 @@ pub const EnqueueErrorSet = error{
     NotEnoughRoom,
 };
 
+const DequeErrorSet = error{
+    /// There are writes pending and we can't retrieve them
+    /// until they're committed.
+    DequeuePending,
+    /// The queue is locked, which only happens during a dequeue.
+    /// The single-reader principle has been violated.
+    DequeueLocked,
+};
+
 /// Define a swap-buffer queue.  Capacity must be an even number, one-half of
 /// which is available for writing at any given moment.  Specify whether you
 /// want notifiers for the reader, the writers, both, or neither.
 pub fn TuQueQue(
     Cell: type,
-    comptime total_capacity: usize,
+    comptime queue_capacity: usize,
     comptime notify: NotificationKind,
 ) type {
     // Sanity checks:
-    if (total_capacity & 1 == total_capacity)
+    if (queue_capacity & 1 == queue_capacity)
         @compileError("Queue capacity is a total capacity, and must be an even number");
-    if (total_capacity > std.math.maxInt(u63))
+    if (queue_capacity > std.math.maxInt(u63))
         @compileError("Not only is this amount of memory unavailable for purchase, we cannot represent it");
 
-    const queue_bytes = alignSizeTo(@sizeOf(Cell) * (total_capacity >> 1), cache_line);
+    const queue_bytes = alignSizeTo(@sizeOf(Cell) * (queue_capacity >> 1), cache_line);
     _ = queue_bytes;
 
-    const half_cap = total_capacity >> 1;
+    const half_cap = queue_capacity >> 1;
 
     return struct {
-        enqueue: CachePad(EnqueueToken),
-        dequeue: CachePad(DequeueToken),
+        /// The status word for enqueuing, always handled with
+        /// .acquire / .release semantics.  All contention happens
+        /// here.
+        enqueuing: CachePad(EnqueueToken),
+        /// The status word for dequeuing. This is handled monotonically,
+        /// because it sees dual-use as a reëntrancy guard, ensuring that only
+        /// one reader (this is a _single-consumer_ queue) ever does mutable
+        /// things.  Monotonic ensures a consistent modification order is seen:
+        /// one reader is in the wrong, and our code can't know which one that
+        /// is.
+        dequeuing: CachePad(DequeueToken),
+        /// The lengths of committed writes.  Acquire-release so that read values
+        /// are always current.  Add-only (except on reset), so no contention here.
         lengths: [2]CachePad(u64),
+        /// The queues.  These are not atomic, because by construction, we
+        /// carefully segregate who can write where.  This can lead to false
+        /// sharing if the Cell type is not itself cache-aligned, but it's up to
+        /// user code what it wants to do about that.
         queues: [2][]Cell,
+        /// A Notifier for the reader, if this queue notifies readers.
         reader_notify: if (reader_notified) Notifier else void,
+        /// A Notifier for the writer, if this queue notifies writers.
         writer_notify: if (writer_notified) Notifier else void,
 
         const Queue = @This();
 
+        /// Errors visible to a writer (enqueuer)
         pub const EnqueueError = EnqueueErrorSet;
+        /// Errors visible to a reader (dequeuer)
+        pub const DequeueError = DequeErrorSet;
 
-        pub const reader_notified = notify.notifyReader();
+        /// Does this type-specialization notify readers?
+        pub const reader_notified: bool = notify.notifyReader();
+        /// Does this type specialization notify writers?
+        pub const writer_notified: bool = notify.notifyWriter();
 
-        pub const writer_notified = notify.notifyWriter();
+        //| Reader API
+        //|
+        //| User code must preserve the **one reader invariant**.  Errors will
+        //| be thrown if the invariant is violated in a detectable manner.
 
         /// Create a new swap-buffer queue.  The queue returned will be closed
         /// for writes.  Destroy when finished with `q.destroy(allocator)`.
@@ -341,11 +404,11 @@ pub fn TuQueQue(
             // TODO: We will allocate all the starting capacity in one
             // block, putting the TuQueQue at the head of it and making
             // the swap queues on the tail.  And align the whole thing.
-            // But that all can wait.
+            // But that all can wait until what we have is tested.
             const q = try allocator.create(Queue);
             errdefer allocator.destroy(q);
-            q.enqueue = EnqueueToken.new(half_cap);
-            q.dequeue = DequeueToken.new();
+            q.enqueuing = EnqueueToken.new(half_cap);
+            q.dequeuing = DequeueToken.new();
             q.lengths[0].getPtr().* = 0;
             q.lenghts[1].get().* = 0;
             q.reader_notify = if (reader_notified) Notifier.new() else {};
@@ -357,18 +420,24 @@ pub fn TuQueQue(
             return q;
         }
 
-        /// Destroy the queue.  Be aware that this can strand writers
-        /// waiting on a notification, if configured for writer-notify.
+        /// Destroy the queue.  Asserts that the queue has already been
+        /// closed.
         pub fn destroy(q: *Queue, allocator: Allocator) void {
-            allocator.free(q.queues[0]);
-            allocator.free(q.queues[1]);
-            allocator.destroy(q);
+            // Some sanity checks:
+            _ = q.withUnlockedDequeue() catch unreachable; // destroy while read on other thread? bad
+            if (q.enqueuing.load(.acquire).closed) {
+                allocator.free(q.queues[0]);
+                allocator.free(q.queues[1]);
+                allocator.destroy(q);
+            } else {
+                @panic("The queue must be closed before it can be destroyed");
+            }
         }
 
         /// If the queue is closed for writes, this will open it.  Otherwise
         /// it will have no effect.
         pub fn open(q: *Queue) void {
-            q.enqueue.getPtr().open(.acq_rel);
+            q.enqueuing.getPtr().open(.acq_rel);
             // Plausible someone might have seen us closed and waited:
             if (comptime writer_notified) {
                 q.writer_notify.notify();
@@ -379,7 +448,7 @@ pub fn TuQueQue(
         /// in the write queue, but no new writes will succeed after this
         /// returns.
         pub fn close(q: *Queue) void {
-            q.enqueue.getPtr().close(.acq_rel);
+            q.enqueuing.getPtr().close(.acq_rel);
             if (comptime writer_notified) {
                 // This is the only time we send a broadcast, because we might
                 // be freeing the queue, and hopefully a bunch of stuck writers
@@ -389,68 +458,130 @@ pub fn TuQueQue(
             }
         }
 
-        /// Try a dequeue-and-swap.  This can be called whether or not the
-        /// last one timed out.  It returns `null` if there are no writes to read,
-        /// or `error.TimedOut` if we spun for too long waiting; otherwise, it
-        /// returns the message-containing slice from the queue.
+        /// Obtain a write handle from the reader.  This is a shared reference
+        /// to the queue, providing only the writer-appropriate actions.
+        pub fn writeHandle(q: *Queue) WriteHandle {
+            return .{ .ptr = @ptrCast(q) };
+        }
+
+        /// Obtain a write notifier, if the queue is so configured.  If not it is
+        /// a compile error to call this function.  A TuQueQue type can checked for
+        /// this affordance with `TuQueQue(...).writer_notified`, if `true` then
+        /// this function will compile when called.
+        pub fn writeNotifier(q: *Queue) Notifier {
+            if (!writer_notified) @compileError("Queue is not configured with a write notifier");
+            return q.writer_notify;
+        }
+
+        /// Try a dequeue-and-swap.  This can be called whether or not the last
+        /// one timed out.  It returns `null` if there are no writes to read, or
+        /// a `DequeueError` if we spun for too long waiting, or the queue was
+        /// already dequeuing (should never happen!), otherwise, it returns the
+        /// message-containing slice from the queue.  This slice is only valid
+        /// until the next call to `tryDequeue`, although some can be requeued
+        /// if needed (see `requeueFromIndex`).
         pub fn tryDequeue(q: *Queue) !?[]Cell {
-            // TODO: only reason to do atomics at all on the dequeue is to put in a
-            // lock-guard, which only matters if user code spuriously creates multiple
-            // readers.  Pick a lane.
-            const old_dequeue = q.dequeue.load(.acquire);
-            if (old_dequeue.length > 0) {
-                // This means we left something in the dequeue.  The canonical reason
-                // this might happen is that we timed out on a previous try.
-                // We handle this case later, for the rest of this function, we assume
-                // it's handled: the dequeue is empty and ready to swap in.
+            // Invariant: our implementation always unlocks the dequeue when
+            // the queue isn't actively accessed from the reader side (this differs
+            // from the original).
+            const dequeue_unlocked = try q.withUnlockedDequeue();
+            defer if (is_debug) {
+                assert(q.dequeuing.load(.monotonic) != DequeueToken.DEQUEUE_LOCK);
+            };
+            return q.tryDequeueInternal(q, dequeue_unlocked);
+        }
+
+        /// Dequeue messages from the queue, waiting on the Notifier as long as
+        /// necessary.  This function is a compile error if reader notification is
+        /// not configured.  To allow it to be error-free, this panics if it sees
+        /// DequeueLocked (which should never happen).
+        pub fn dequeue(q: *Queue) []Cell {
+            if (!reader_notified) @compileError("This queue doesn't notify readers, use tryDequeue");
+            if (q.tryDequeue()) |maybe_cells| if (maybe_cells) |cells| {
+                return cells;
+            } else { // Nothing yet, so we wait
+                q.reader_notify.wait();
+                return q.dequeue();
+            } else |err| {
+                switch (err) {
+                    DequeueError.DequeuePending => {
+                        // Read not completed; we wait
+                        q.reader_notify.wait();
+                        return q.dequeuing();
+                    },
+                    DequeueError.DequeueLocked => @panic("Dequeue was locked within q.dequeue"),
+                }
             }
-            // Get the capacity (resizing means this can change from half_cap).
-            // This 'side' is never contended, and only we can change it, so no
-            // atomic ordering is needed.
-            const next_capacity = q.queues[old_dequeue.index].len;
-            const new_enqueue: EnqueueToken = .{ .index = old_dequeue.index, .capacity_remaining = next_capacity, .closed = false };
-            // This gets us the latest possible value, any writer who 'happens-after'
-            // this is on the dequeue.  swap-buffer-queue does a spin CAS here, but
-            // I don't see a reason to do that.
-            const old_enqueue = q.enqueue.swap(new_enqueue, .acq_rel);
-            // Sanity check: we actually swapped the index
-            assert(old_enqueue.index != old_dequeue.index);
-            // For clarity:
-            const new_dq_index = old_enqueue.index;
-            const this_capacity = q.queues[new_dq_index].len;
-            if (this_capacity == old_enqueue.capacity_remaining) {
-                // No writes, commit the dequeue length and bail
-                const new_dq: DequeueToken = .{ .index = new_dq_index, .length = 0 };
-                q.dequeue.store(new_dq, .release);
-                return null;
+        }
+
+        /// Tries to dequeue, waits `timeout_ns` for a signal, then tries again with
+        /// `tryDequeue`.  This is a compile error without reader notification configured.
+        pub fn dequeueWithTimeout(q: *Queue, timeout_ns: usize) !?[]Cell {
+            if (!reader_notified) @compileError("This queue doesn't notify readers, use tryDequeue");
+            if (q.tryDequeue()) |maybe_cells| if (maybe_cells) |cells| {
+                return cells;
+            } else { // Nothing yet, so we wait
+                q.reader_notify.timedWait(timeout_ns);
+                return q.tryDequeue();
+            } else |err| {
+                switch (err) {
+                    DequeueError.DequeuePending => {
+                        // Read not completed; we wait
+                        q.reader_notify.timedWait(timeout_ns);
+                        return q.tryDequeue();
+                    },
+                    DequeueError.DequeueLocked => |e| return e,
+                }
             }
-            // Our capacity remaining must be less than the total capacity of the slice,
-            // now strictly less, since we handled the equal case
-            assert(this_capacity > old_enqueue.capacity_remaining);
-            // length + remaining_capacity == capacity when all writes are committed
-            const this_len = q.lengths[new_dq_index].load(.acquire);
-            switch (std.math.order(this_len + old_enqueue.capacity_remaining, this_capacity)) {
-                .lt => {
-                    // We have some writes in-flight, deal with it
-                    // TODO: deal with it
-                },
-                .eq => {
-                    // We may take our slice, but first, commit the dequeue state
-                    const new_dq: DequeueToken = .{ .index = new_dq_index, .length = 0 };
-                    q.dequeue.store(new_dq, .release);
-                    if (this_len == 0) {
-                        unreachable; // We returned null already
-                    } else {
-                        if (comptime writer_notified) {
-                            q.reader_notify.notify();
-                        }
-                        return q.queues[new_dq_index][0..this_len];
-                    }
-                },
-                .gt => {
-                    @panic("length + capacity_remaining is over capacity, this shouldn't happen. transaction error?");
-                },
-            }
+        }
+
+        /// If you need to requeue some of a slice, you can.  If the
+        /// unused portion of the slice would be `cells[i..]`, call
+        /// `try q.requeueFromSlice(i)`, and you'll get it back on
+        /// the next dequeue.  Asserts that `i` is `<=` the length of
+        /// the returned slice, the only error is if the queue is locked.
+        pub fn requeueFromIndex(q: *Queue, index: usize) error{LockedDequeue}!void {
+            var the_dequeue = try q.withUnlockedDequeue();
+            the_dequeue.length_remaining += index;
+            // This also unlocks the dequeue
+            q.dequeuing.store(the_dequeue, .monotonic);
+        }
+
+        /// Answers whether the writable half of the queue is full.  Uses a
+        /// monotonic read, because 'true' stays that way until dequeued,
+        /// and 'false' can become true after the call, so .acquire doesn't
+        /// really help us here.
+        pub fn isQueueFull(q: *Queue) bool {
+            return q.enqueuing.load(.monotonic).capacity_remaining == 0;
+        }
+
+        /// Return the number of available Cells on a best-effort,
+        /// monotonic basis.  There is no guarantee that the next dequeue
+        /// will return all of these messages, and it may return more.
+        /// Tries may error out due to DequeuePending, possibly more than
+        /// once.  A persistent reader will see this many messages after
+        /// enough diligence, and before that happens, a blocking read
+        /// with `dequeue` will not sleep on empty, just pending.
+        pub fn available(q: *Queue) usize {
+            const the_dequeue = try q.withUnlockedDequeue();
+            defer q.dequeuing.store(the_dequeue, .monotonic);
+            const the_enqueue = q.enqueuing.load(.monotonic);
+            const capacity = q.queues[the_enqueue.index].len;
+            return (capacity - the_enqueue.capacity_remaining) + the_dequeue.length_remaining;
+        }
+
+        /// Wait the thread without trying for new messages, before or after.
+        /// Requires a reader notifier.
+        pub fn wait(q: *Queue) void {
+            if (!reader_notified) @compileError("Can't wait without a notifier");
+            q.reader_notify.wait();
+        }
+
+        /// Wait the thread for about `timeout_ns`, without trying for new
+        /// messages, before or after.  Requires a reader notifier.
+        pub fn timedWait(q: *Queue, timeout_ns: usize) void {
+            if (!reader_notified) @compileError("Can't wait without a notifier");
+            q.reader_notify.timedWait(timeout_ns);
         }
 
         //| Writer API
@@ -462,28 +593,171 @@ pub fn TuQueQue(
         //| later is a coherent action, and not even an uncommon one.
 
         /// Attempt to enqueue one value of Cell.  Errors if there isn't room.
-        pub fn tryEnqueueValue(q: *Queue, val: Cell) !void {
+        pub fn enqueueValue(q: *Queue, val: Cell) !void {
             const v_slice: [1]Cell = .{val};
-            return q.tryEnqueueSlice(q, &v_slice);
+            return q.enqueueSlice(q, &v_slice);
         }
 
         /// Attempt to enqueue a slice of Cell values.  Errors if there isn't room,
         /// does not attempt to write some of the slice if there isn't room for
         /// all of it.
-        pub fn tryEnqueueSlice(q: *Queue, vals: []Cell) EnqueueError!void {
+        pub fn enqueueSlice(q: *Queue, vals: []Cell) EnqueueError!void {
             const our_slice, const index = try q.reserveSliceInternal(vals.len);
             @memcpy(our_slice, vals); // This asserts len == len for us
             // Now commit:
-            q.commit(vals.len, index);
+            q.commitEnqueue(vals.len, index);
             return;
         }
 
-        pub fn tryReserveSlice(q: *Queue, slots: usize) EnqueueError!struct { WriteHandle.Reservation, []Cell } {
+        /// Correct use of this function involves the WriteHandle directly.  Rather than mess around
+        /// with a reader-side-specific version of this function, which probably won't be needed,
+        /// readers can always create a WriteHandle and call it that way.
+        fn reserveSlice(q: *Queue, slots: usize) EnqueueError!struct { WriteHandle.Reservation, []Cell } {
             const our_slice, const index = try q.reserveSliceInternal(slots);
             return .{ WriteHandle.Reservation.some(index, slots), our_slice };
         }
 
-        fn commit(q: *Queue, slots: usize, index: u1) void {
+        //| Private
+
+        // Loads the dequeue, erroring out if it's in the locked state.  If
+        // not, it swaps the locked state in, and returns the current (actual)
+        // dequeue state to the caller.
+        fn withUnlockedDequeue(q: *Queue) error{LockedDequeue}!DequeueToken {
+            const the_dequeue = q.dequeuing.load(.monotonic);
+            if (the_dequeue == DequeueToken.DEQUEUE_LOCK) return error.LockedDequeue;
+            return q.dequeuing.swap(DequeueToken.DEQUEUE_LOCK, .monotonic);
+        }
+
+        fn tryDequeueInternal(q: *Queue, old_dequeue: DequeueToken) DequeueError!?[]Cell {
+            assert(q.dequeuing.raw == DequeueToken.DEQUEUE_LOCK);
+            if (old_dequeue.length_remaining > 0) {
+                // This means we left something in the dequeue.  The canonical reason
+                // this might happen is that we timed out on a previous try, but we
+                // may also have requeued some of it.
+                return try q.dequeueWait(.gte, old_dequeue.index, old_dequeue.length_remaining);
+            } else {
+                // We can swap the buffer.  As a correctness aid in development,
+                // let's wipe out the queue we just finished reading.  Might make
+                // sense to make this an optional security feature as well (would be
+                // faster to do it for write-reserves only though).
+                if (is_debug) {
+                    @memset(q.queues[old_dequeue.index], 0xaa);
+                }
+            }
+            // Get the capacity (resizing means this can change from half_cap).
+            // This 'side' is never contended, and only we can change it, so no
+            // atomic ordering is needed.
+            const next_capacity = q.queues[old_dequeue.index].len;
+            // We need 'closedness' from the existing enqueue, because this might
+            // be a final cleanup pass:
+            const new_enqueue: EnqueueToken = new: {
+                const enqueue_at_first = q.enqueuing.load(.acquire);
+                break :new .{
+                    .index = old_dequeue.index,
+                    .capacity_remaining = next_capacity,
+                    .closed = enqueue_at_first.closed,
+                };
+            };
+            // This gets us the latest possible value, any writer who
+            // 'happens-after' this is on the dequeue. swap-buffer-queue does a
+            // spin CAS here, to prevent overwriting a concurrenct close: but we
+            // use a reader-only close protocol, so that's not a problem for us.
+            // We get the latest possible capacity reservation, and that's what
+            // we need.
+            const old_enqueue = q.enqueuing.swap(new_enqueue, .acq_rel);
+            // Sanity check: we actually swapped the index
+            assert(old_enqueue.index != old_dequeue.index);
+            // The swap immediately makes the other queue available, so that's
+            // when we notify the writer side:
+            if (comptime writer_notified) {
+                q.writer_notify.notify();
+            }
+            // For clarity:
+            const new_dq_index = old_enqueue.index;
+            const total_capacity = q.queues[new_dq_index].len;
+            if (total_capacity == old_enqueue.capacity_remaining) {
+                // No writes, commit the dequeue length and bail
+                const new_dq: DequeueToken = .{ .index = new_dq_index, .length_remaining = 0 };
+                q.dequeuing.store(new_dq, .release);
+                return null;
+            }
+            // Our capacity remaining must be less than the total capacity of the slice,
+            // now strictly less, since we handled the equal case
+            assert(total_capacity > old_enqueue.capacity_remaining);
+            // length + remaining_capacity == capacity when all writes are committed
+            const this_len = q.lengths[new_dq_index].load(.acquire);
+            switch (order(this_len + old_enqueue.capacity_remaining, total_capacity)) {
+                .lt => {
+                    // We have some writes in-flight, deal with it
+                    // We expect the exact length, which is: total capacity
+                    // - capacity remaining.  We know this won't underflow
+                    try q.dequeueWait(.eq, old_enqueue.index, total_capacity - old_enqueue.capacity_remaining);
+                },
+                .eq => {
+                    // We may take our slice, but first, commit the dequeue state
+                    q.resetDequeue(new_dq_index);
+                    if (this_len == 0) {
+                        unreachable; // We returned null already
+                    } else {
+                        return q.queues[new_dq_index][0..this_len];
+                    }
+                },
+                .gt => {
+                    @panic("length + capacity_remaining is over capacity, this shouldn't happen. transaction error?");
+                },
+            }
+        }
+
+        /// Set the dequeue to the provided index, and its token length-remaining
+        /// and tracked q.lengths to zero.
+        fn resetDequeue(q: *Queue, dq_index: u1) void {
+            q.lengths[dq_index].store(0, .release);
+            const next_dq: DequeueToken = .{ .index = dq_index, .length_remaining = 0 };
+            q.dequeuing.store(next_dq, .monotonic);
+        }
+
+        fn dequeueWait(q: *Queue, comparison: Compare, index: u1, length: u62) DequeueError![]Cell {
+            // We want an exact match after we swapped, and accept greater-than when we
+            // return, because we might have re-queued part of our dequeue buffer.  So
+            // we pass in a comparison.
+            var buffer_len: u62 = undefined;
+            for (0..SPIN_LIMIT) |_| {
+                // We're waiting for the reported length to catch up to the
+                // expected length (total capacity - capacity remaining).
+                // Also, some of the queue may have been consumed, so the length
+                // can be greater, not just equal.  Our `comparison` tells which.
+                buffer_len = q.lengths[index].load(.acquire);
+                if (compare(buffer_len, comparison, length)) {
+                    // We got it: if length is the same as buffer len it's
+                    // the whole slice, otherwise it's what we left from last time.
+                    // Fortunately, the math is the same.
+                    const start = buffer_len - length;
+                    const our_slice = q.queues[index][start..buffer_len];
+                    // Unlock the dequeue state and set it to zero remaining.
+                    q.resetDequeue(index);
+                    return our_slice;
+                } else if (comptime is_debug) {
+                    if (comparison == .eq and buffer_len > length) {
+                        @panic("Buffer length should never exceed length after a queue swap");
+                    }
+                    // If this bug slips through to production, it's (relatively!) harmless,
+                    // because we'll accept `>` when we retry.  The correctness issue would
+                    // remain, however.
+                }
+                spinLoopHint();
+            }
+            // TODO: In principle, we can just take what we have here, right?
+            // I'm putting that off until I see how it interacts with requeuing,
+            // I think it requires tracking one more variable, but that's fine.
+
+            // Commit our expected length, and tell reader we aren't ready yet.
+            const stored_dequeue: DequeueToken = .{ .index = index, .length_remaining = length };
+            q.dequeuing.store(stored_dequeue, .monotonic);
+
+            return DequeueError.DequeuePending;
+        }
+
+        fn commitEnqueue(q: *Queue, slots: usize, index: u1) void {
             @atomicRmw(u62, &q.lengths[index].getPtr(), .Add, slots, .release);
             // All good!
             if (reader_notified) {
@@ -500,7 +774,7 @@ pub fn TuQueQue(
             // The contention can't fail, so we spin for it, but we can fail
             // to get our space, queue could be closed too.
             const en_q_ours: EnqueueToken = busy: while (true) {
-                this_enqueue = q.enqueue.load(.acquire);
+                this_enqueue = q.enqueuing.load(.acquire);
                 if (this_enqueue.closed) {
                     return EnqueueError.QueueIsClosed;
                 } else if (this_enqueue.capacity == 0) {
@@ -509,7 +783,7 @@ pub fn TuQueQue(
                 if (this_enqueue.tryReserve(slots)) |en_q_reserve| {
                     if (@cmpxchgWeak(
                         EnqueueToken,
-                        q.enqueue.getPtr(),
+                        q.enqueuing.getPtr(),
                         this_enqueue,
                         en_q_reserve,
                         .release,
@@ -557,37 +831,117 @@ pub fn TuQueQue(
 
                 pub const None: Reservation = .{ .index = 0, .len = 0, .something = false };
 
-                pub fn some(index: u1, len: u62) Reservation {
-                    return .{ .index = index, .len = len, .something = true };
+                pub fn some(index: u1, len: usize) Reservation {
+                    return .{ .index = index, .len = @intCast(len), .something = true };
                 }
             };
 
-            pub fn tryEnqueueValue(wh: *WriteHandle, val: Cell) EnqueueError!void {
+            /// Try to enqueue a single value onto the queue.
+            pub fn enqueueValue(wh: *WriteHandle, val: Cell) EnqueueError!void {
                 const q: *Queue = @ptrCast(@alignCast(wh.ptr));
-                return q.tryEnqueueValue(val);
+                return q.enqueueValue(val);
             }
 
-            pub fn tryEnqueueSlice(wh: *WriteHandle, vals: []Cell) EnqueueError!void {
+            /// Try to enqueue a slice of values onto the queue.  All will be
+            /// written, or none will be.
+            pub fn enqueueSlice(wh: *WriteHandle, vals: []Cell) EnqueueError!void {
                 const q: *Queue = @ptrCast(@alignCast(wh.ptr));
-                return q.tryEnqueueSlice(vals);
+                return q.enqueueSlice(vals);
             }
 
-            pub fn tryReserveSlice(wh: *WriteHandle, slots: usize) EnqueueError![]Cell {
+            /// Try to reserve a slice of length `slots`.  When returned, there
+            /// is an open transaction, and the reader cannot dequeue until the
+            /// write is done and the WriteHandle calls `wh.commit()`.  Only one
+            /// slot can be reserved at a time by any given writer.
+            pub fn reserveSlice(wh: *WriteHandle, slots: usize) EnqueueError![]Cell {
                 assert(wh.reserve.something == false);
                 const q: *Queue = @ptrCast(@alignCast(wh.ptr));
-                wh.reserve, const our_slice = try q.tryReserveSlice(slots);
+                wh.reserve, const our_slice = try q.reserveSlice(slots);
+                if (secure_erase) {
+                    std.crypto.secureZero(Cell, our_slice);
+                }
                 return our_slice;
             }
 
+            /// Commit a write into a reserved slice.  Asserts that a slice was
+            /// actually reserved.
             pub fn commit(wh: *WriteHandle) void {
                 assert(wh.reserve.something == true);
                 defer wh.reserve = Reservation.None;
                 const q: *Queue = @ptrCast(@alignCast(wh.ptr));
-                q.commit(wh.reserve.len, wh.reserve.index);
+                q.commitEnqueue(wh.reserve.len, wh.reserve.index);
+            }
+
+            /// Obtain a write Notifier.  Really there should be one of these, not
+            /// many, but one writer is a valid use of a many-writer queue, so
+            /// obtaining it from the WriteHandle is made possible.  Note that
+            /// this is a compile error to call if write notification is not
+            /// enabled for this queue type.
+            pub fn writeNotifier(wh: *WriteHandle) Notifier {
+                const q: *Queue = @ptrCast(@alignCast(wh.ptr));
+                return q.writeNotifier();
+            }
+
+            /// Check whether the queue is full.  Usually it makes more sense to
+            /// just try and enqueue, TOCTOU applies here in both directions.
+            /// But it's a coherent writer-side query, so here it is.
+            pub fn isQueueFull(wh: *WriteHandle) bool {
+                const q: *Queue = @ptrCast(@alignCast(wh.ptr));
+                return q.isQueueFull();
             }
         };
     };
 }
+
+// The 15.2 version of order is inefficient, this produces
+// optimal code.
+inline fn order(a: anytype, b: anytype) Order {
+    if (a < b)
+        return .lt
+    else if (a > b)
+        return .gt
+    else
+        return .eq;
+}
+
+// The 15.2 version of compare is inefficient.  This produces
+// optimal code, and you can see why.
+inline fn compare(a: anytype, cmp: Compare, b: anytype) bool {
+    const ord = @intFromEnum(order(a, b));
+    return switch (cmp) {
+        .lt => ord < 0,
+        .lte => ord <= 0,
+        .eq => ord == 0,
+        .gte => ord >= 0,
+        .gt => ord > 0,
+        .neq => ord != 0,
+    };
+}
+
+test order {
+    try expectEqual(.lt, order(3, 4));
+    try expectEqual(.eq, order(4, 4));
+    try expectEqual(.gt, order(4, 3));
+}
+
+test compare {
+    try expect(compare(3, .lt, 4));
+    try expect(compare(3, .lte, 4));
+    try expect(compare(4, .eq, 4));
+    try expect(compare(4, .lte, 4));
+    try expect(compare(4, .gte, 4));
+    try expect(compare(4, .gt, 3));
+    try expect(compare(4, .gte, 3));
+}
+
+const Compare = std.math.CompareOperator;
+
+/// CPU-efficient verion of std.math.Order.
+const Order = enum(i2) {
+    lt = -1,
+    eq,
+    gt,
+};
 
 test alignSizeTo {
     try expectEqual(256, alignSizeTo(129, 128));
@@ -615,10 +969,15 @@ test "pointer casting" {
 }
 
 const BACKOFF_LIMIT = 12; // Eventually configurable via option (for thread-san)
+const SPIN_LIMIT = 64; // Likewise
+const secure_erase: bool = false; // Also likewise, although maybe type configurable?
 
 const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
+
+const builtin = @import("builtin");
+const is_debug = builtin.mode == .Debug;
 
 const AtomicOrder = std.builtin.AtomicOrder;
 const cache_line = std.atomic.cache_line;
