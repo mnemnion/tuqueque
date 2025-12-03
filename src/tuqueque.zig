@@ -290,6 +290,16 @@ pub const NotificationKind = enum {
     }
 };
 
+/// Errors which could be returned if a write fails
+pub const EnqueueErrorSet = error{
+    /// No one can write to the queue
+    QueueIsClosed,
+    /// There is no room left in the (half) queue at all
+    QueueIsFull,
+    /// There is not enough room to write the entire slice provided.
+    NotEnoughRoom,
+};
+
 /// Define a swap-buffer queue.  Capacity must be an even number, one-half of
 /// which is available for writing at any given moment.  Specify whether you
 /// want notifiers for the reader, the writers, both, or neither.
@@ -318,6 +328,8 @@ pub fn TuQueQue(
         writer_notify: if (writer_notified) Notifier else void,
 
         const Queue = @This();
+
+        pub const EnqueueError = EnqueueErrorSet;
 
         pub const reader_notified = notify.notifyReader();
 
@@ -385,8 +397,8 @@ pub fn TuQueQue(
             // TODO: only reason to do atomics at all on the dequeue is to put in a
             // lock-guard, which only matters if user code spuriously creates multiple
             // readers.  Pick a lane.
-            const dq_tok = q.dequeue.load(.acquire);
-            if (dq_tok.length > 0) {
+            const old_dequeue = q.dequeue.load(.acquire);
+            if (old_dequeue.length > 0) {
                 // This means we left something in the dequeue.  The canonical reason
                 // this might happen is that we timed out on a previous try.
                 // We handle this case later, for the rest of this function, we assume
@@ -395,42 +407,185 @@ pub fn TuQueQue(
             // Get the capacity (resizing means this can change from half_cap).
             // This 'side' is never contended, and only we can change it, so no
             // atomic ordering is needed.
-            const next_capacity = q.queues[dq_tok.index].len;
-            const next_enqueue: EnqueueToken = .{ .index = dq_tok.index, .capacity_remaining = next_capacity, .closed = false };
-            const this_enqueue = q.enqueue.swap(next_enqueue, .acq_rel);
+            const next_capacity = q.queues[old_dequeue.index].len;
+            const new_enqueue: EnqueueToken = .{ .index = old_dequeue.index, .capacity_remaining = next_capacity, .closed = false };
+            // This gets us the latest possible value, any writer who 'happens-after'
+            // this is on the dequeue.  swap-buffer-queue does a spin CAS here, but
+            // I don't see a reason to do that.
+            const old_enqueue = q.enqueue.swap(new_enqueue, .acq_rel);
             // Sanity check: we actually swapped the index
-            assert(this_enqueue.index != dq_tok.index);
-            const this_capacity = q.queues[this_enqueue.index].len;
-            // Our capacity remaining must be less than the total capacity of the slice
-            assert(this_capacity >= this_enqueue.capacity_remaining);
-            // length + remaining_capacity == capacity when all writes are committed
-            const this_len = q.lengths[this_enqueue.index].load(.acquire);
-            if (this_len + this_enqueue.capacity_remaining < this_capacity) {
-                // We have some writes in-flight, deal with it
-                // TODO: deal with it
-            } else {
-                // We may take our slice, but first, commit the dequeue state
-                const new_dq: DequeueToken = .{ .index = this_enqueue.index, .length = 0 };
+            assert(old_enqueue.index != old_dequeue.index);
+            // For clarity:
+            const new_dq_index = old_enqueue.index;
+            const this_capacity = q.queues[new_dq_index].len;
+            if (this_capacity == old_enqueue.capacity_remaining) {
+                // No writes, commit the dequeue length and bail
+                const new_dq: DequeueToken = .{ .index = new_dq_index, .length = 0 };
                 q.dequeue.store(new_dq, .release);
-                // After all that, it's possible there were no writes.  If so, this was all
-                // very fast and the swap doesn't matter one way or the other, we just:
-                if (this_len == 0) {
-                    return null;
-                } else {
-                    // `this_enqueue.index` is now officially our dequeue index:
-                    return q.queues[this_enqueue.index][0..this_len];
-                }
+                return null;
+            }
+            // Our capacity remaining must be less than the total capacity of the slice,
+            // now strictly less, since we handled the equal case
+            assert(this_capacity > old_enqueue.capacity_remaining);
+            // length + remaining_capacity == capacity when all writes are committed
+            const this_len = q.lengths[new_dq_index].load(.acquire);
+            switch (std.math.order(this_len + old_enqueue.capacity_remaining, this_capacity)) {
+                .lt => {
+                    // We have some writes in-flight, deal with it
+                    // TODO: deal with it
+                },
+                .eq => {
+                    // We may take our slice, but first, commit the dequeue state
+                    const new_dq: DequeueToken = .{ .index = new_dq_index, .length = 0 };
+                    q.dequeue.store(new_dq, .release);
+                    if (this_len == 0) {
+                        unreachable; // We returned null already
+                    } else {
+                        if (comptime writer_notified) {
+                            q.reader_notify.notify();
+                        }
+                        return q.queues[new_dq_index][0..this_len];
+                    }
+                },
+                .gt => {
+                    @panic("length + capacity_remaining is over capacity, this shouldn't happen. transaction error?");
+                },
             }
         }
 
-        pub fn tryEnqueueOne(q: *Queue, val: Cell) !void {
+        //| Writer API
+        //|
+        //| Writers should request and use a WriteHandle, in preference to sharing 'public'
+        //| references to the queue itself (owned by the reader).
+        //|
+        //| However, these methods are public, because a read-thread enqueuing something for
+        //| later is a coherent action, and not even an uncommon one.
+
+        /// Attempt to enqueue one value of Cell.  Errors if there isn't room.
+        pub fn tryEnqueueValue(q: *Queue, val: Cell) !void {
             const v_slice: [1]Cell = .{val};
             return q.tryEnqueueSlice(q, &v_slice);
         }
 
-        pub fn tryEnqueueSlice(q: *Queue, vals: []Cell) !void {
-            _ = .{ q, vals };
+        /// Attempt to enqueue a slice of Cell values.  Errors if there isn't room,
+        /// does not attempt to write some of the slice if there isn't room for
+        /// all of it.
+        pub fn tryEnqueueSlice(q: *Queue, vals: []Cell) EnqueueError!void {
+            const our_slice, const index = try q.reserveSliceInternal(vals.len);
+            @memcpy(our_slice, vals); // This asserts len == len for us
+            // Now commit:
+            q.commit(vals.len, index);
+            return;
         }
+
+        pub fn tryReserveSlice(q: *Queue, slots: usize) EnqueueError!struct { WriteHandle.Reservation, []Cell } {
+            const our_slice, const index = try q.reserveSliceInternal(slots);
+            return .{ WriteHandle.Reservation.some(index, slots), our_slice };
+        }
+
+        fn commit(q: *Queue, slots: usize, index: u1) void {
+            @atomicRmw(u62, &q.lengths[index].getPtr(), .Add, slots, .release);
+            // All good!
+            if (reader_notified) {
+                q.reader_notify.notify();
+            }
+        }
+
+        /// Try to reserve a slice of the queue.  If we succeed, returns both the slice,
+        /// and the commit index to write the length at once we've used it.
+        fn reserveSliceInternal(q: *Queue, slots: usize) EnqueueError!struct { []Cell, u1 } {
+            var this_enqueue: EnqueueToken = undefined;
+            var back_off: usize = 1;
+            var log_backoff: usize = 1;
+            // The contention can't fail, so we spin for it, but we can fail
+            // to get our space, queue could be closed too.
+            const en_q_ours: EnqueueToken = busy: while (true) {
+                this_enqueue = q.enqueue.load(.acquire);
+                if (this_enqueue.closed) {
+                    return EnqueueError.QueueIsClosed;
+                } else if (this_enqueue.capacity == 0) {
+                    return EnqueueError.QueueIsFull;
+                }
+                if (this_enqueue.tryReserve(slots)) |en_q_reserve| {
+                    if (@cmpxchgWeak(
+                        EnqueueToken,
+                        q.enqueue.getPtr(),
+                        this_enqueue,
+                        en_q_reserve,
+                        .release,
+                        .monotonic,
+                    )) |_| {
+                        for (0..back_off) |_| {
+                            spinLoopHint();
+                        }
+                        if (log_backoff < BACKOFF_LIMIT) {
+                            log_backoff += 1;
+                            back_off *= 2;
+                        }
+                    } else {
+                        break :busy en_q_reserve;
+                    }
+                } else {
+                    return EnqueueError.NotEnoughRoom;
+                }
+            };
+            assert(this_enqueue.index == en_q_ours.index);
+            assert(this_enqueue.capacity_remaining - en_q_ours.capacity_remaining == slots);
+            // We got our slots! We need a length, so we work backward
+            // from our reservation.  Capacity (slice length) never changes
+            // on the enqueue, so we can just read this:
+            const capacity = q.queues[en_q_ours.index].len;
+            // Our allocation starts at:
+            const start = capacity - this_enqueue.capacity_remaining;
+            return .{ q.queues[en_q_ours.index][start..][0..slots], en_q_ours.index };
+        }
+
+        /// A WriteHandle is the writer interface to our queue.
+        pub const WriteHandle = struct {
+            ptr: *anyopaque,
+            reserve: Reservation = .None,
+
+            // Zig doesn't have niche-optimizations for most values yet,
+            // so we fake it:
+
+            /// A reservation.  When a WriteHandle grabs a slice, the reservation
+            /// is set, and used to commit the write to the queue.  Always commit!
+            pub const Reservation = packed struct(u64) {
+                index: u1,
+                len: u62,
+                something: bool,
+
+                pub const None: Reservation = .{ .index = 0, .len = 0, .something = false };
+
+                pub fn some(index: u1, len: u62) Reservation {
+                    return .{ .index = index, .len = len, .something = true };
+                }
+            };
+
+            pub fn tryEnqueueValue(wh: *WriteHandle, val: Cell) EnqueueError!void {
+                const q: *Queue = @ptrCast(@alignCast(wh.ptr));
+                return q.tryEnqueueValue(val);
+            }
+
+            pub fn tryEnqueueSlice(wh: *WriteHandle, vals: []Cell) EnqueueError!void {
+                const q: *Queue = @ptrCast(@alignCast(wh.ptr));
+                return q.tryEnqueueSlice(vals);
+            }
+
+            pub fn tryReserveSlice(wh: *WriteHandle, slots: usize) EnqueueError![]Cell {
+                assert(wh.reserve.something == false);
+                const q: *Queue = @ptrCast(@alignCast(wh.ptr));
+                wh.reserve, const our_slice = try q.tryReserveSlice(slots);
+                return our_slice;
+            }
+
+            pub fn commit(wh: *WriteHandle) void {
+                assert(wh.reserve.something == true);
+                defer wh.reserve = Reservation.None;
+                const q: *Queue = @ptrCast(@alignCast(wh.ptr));
+                q.commit(wh.reserve.len, wh.reserve.index);
+            }
+        };
     };
 }
 
@@ -458,6 +613,8 @@ test "pointer casting" {
     try expect(!u_p.closed);
     try expectEqual(up_now, u_p);
 }
+
+const BACKOFF_LIMIT = 12; // Eventually configurable via option (for thread-san)
 
 const std = @import("std");
 const assert = std.debug.assert;
