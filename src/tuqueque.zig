@@ -327,6 +327,7 @@ pub fn TuQueQue(
             q.lengths[1].raw = 0;
             q.reader_notify = if (reader_notified) Notifier.new() else {};
             q.writer_notify = if (writer_notified) Notifier.new() else {};
+            q.writer_refs = if (refcounted) .{ .raw = 0 } else {};
             q.queues[0] = try allocator.alignedAlloc(Cell, cache_align, start_cap);
             // q.queues[0] = try allocator.alloc(Cell, start_cap);
             errdefer allocator.free(q.queues[0]);
@@ -343,6 +344,8 @@ pub fn TuQueQue(
             // Some sanity checks:
             _ = q.getAndLockDequeue() catch @panic("Queue left in locked state");
             if (comptime refcounted) {
+                const refs = q.writer_refs.load(.acquire);
+                _ = refs; // Refcount debugging, it's a things
                 assert(q.writer_refs.load(.acquire) == 0);
             }
             if (q.enqueuing.load(.acquire).closed) {
@@ -390,7 +393,8 @@ pub fn TuQueQue(
         /// to the queue, providing only the writer-appropriate actions.
         pub fn writeHandle(q: *Queue) WriteHandle {
             if (comptime refcounted) {
-                _ = q.writer_refs.fetchAdd(1, .monotonic);
+                const was = q.writer_refs.fetchAdd(1, .monotonic);
+                _ = was; // refcount debugging again
             }
             return .{ .ptr = @ptrCast(q) };
         }
@@ -589,7 +593,7 @@ pub fn TuQueQue(
         /// Attempt to enqueue one value of Cell.  Errors if there isn't room.
         pub fn enqueueValue(q: *Queue, val: Cell) EnqueueError!void {
             const v_slice: [1]Cell = .{val};
-            return q.enqueueSlice(q, &v_slice);
+            return q.enqueueSlice(&v_slice);
         }
 
         /// Attempt to enqueue a slice of Cell values.  Errors if there isn't room,
@@ -611,7 +615,7 @@ pub fn TuQueQue(
         /// with a reader-side-specific version of this function, which probably won't be needed,
         /// readers can always create a WriteHandle and call it that way.
         fn reserveSlice(q: *Queue, slots: usize) EnqueueError!struct { WriteHandle.Reservation, []Cell } {
-            const our_slice, const index = try q.reserveSliceInternal(slots);
+            const our_slice, const index = try q.reserveSliceInternal(@intCast(slots));
             return .{ WriteHandle.Reservation.some(index, slots), our_slice };
         }
 
@@ -840,7 +844,7 @@ pub fn TuQueQue(
 
             /// Try to enqueue a slice of values onto the queue.  All will be
             /// written, or none will be.
-            pub fn enqueueSlice(wh: *WriteHandle, vals: []Cell) EnqueueError!void {
+            pub fn enqueueSlice(wh: *WriteHandle, vals: []const Cell) EnqueueError!void {
                 const q: *Queue = @ptrCast(@alignCast(wh.ptr));
                 return q.enqueueSlice(vals);
             }
@@ -909,7 +913,7 @@ pub fn TuQueQue(
                     const left = q.writer_refs.fetchSub(1, .release);
                     if (left == 1) {
                         _ = q.writer_refs.load(.acquire);
-                    } else if (is_safe and left == std.math.maxInt(usize)) {
+                    } else if (is_safe and left == std.math.maxInt(usize)) { // unreachable
                         @panic("Writer handle reference count underflow, too many releases");
                     }
                 }
@@ -930,21 +934,6 @@ pub const EnqueueToken = packed struct(u64) {
     /// and it is closed.
     pub fn new(capacity: u64) EnqueueToken {
         return .{ .index = 0, .capacity_remaining = @truncate(capacity), .closed = true };
-    }
-
-    pub fn fromWord(word: u64) EnqueueToken {
-        return @bitCast(word);
-    }
-
-    pub fn toWord(e_state: EnqueueToken) u64 {
-        return @bitCast(e_state);
-    }
-
-    // Not atomic. Dubious!
-    pub fn switchQueue(e_state: EnqueueToken) EnqueueToken {
-        var e_new = e_state;
-        e_new.index +%= 1;
-        return e_new;
     }
 
     // Try to reserve 'slots' in the queue.  If that much is available, it is
@@ -1168,12 +1157,55 @@ test "queue full" {
     try expectEqual(3, new_q.remainingCapacity());
 }
 
+test "WriteHandle" {
+    const SmolQ = TuQueQue(u8, 6, .{ .notify = .neither, .refcount = true });
+    var q = try SmolQ.create(talloc);
+    var danger_zone = true;
+    defer {
+        if (danger_zone) {
+            q.errDestroy(talloc); // unreachable
+        } else {
+            q.destroy(talloc);
+        }
+    }
+    q.open();
+    try expectEqual(6, q.queueTotalCapacity(.both));
+    try expectEqual(3, q.queueTotalCapacity(.enqueue));
+    try expectEqual(3, q.queueTotalCapacity(.dequeue));
+    var wh = q.writeHandle();
+    try expectEqual(1, q.writeHandlesRemaining());
+    wh.enqueueSlice("ab") catch return expect(false);
+    try expectError(EnqueueErrorSet.NotEnoughRoom, q.enqueueSlice("cd"));
+    try expect(!q.queueIsFull());
+    try expectEqual(1, q.remainingCapacity());
+    wh.enqueueValue('c') catch return expect(false);
+    try expectError(EnqueueErrorSet.QueueIsFull, q.enqueueSlice("d"));
+    try expectEqual(0, q.remainingCapacity());
+    try expect(q.queueIsFull());
+    try expectEqualStrings("abc", (q.tryDequeue() catch return expect(false)).?);
+    try expectEqual(3, q.remainingCapacity());
+    const slice = try wh.reserveSlice(3);
+    @memcpy(slice, "def");
+    wh.commit();
+    try expect(wh.queueIsFull());
+    try expectEqualStrings("def", (q.tryDequeue() catch return expect(false)).?);
+    q.close();
+    try expectEqual(EnqueueErrorSet.QueueIsClosed, wh.enqueueValue('?'));
+    try expectEqual(EnqueueErrorSet.QueueIsClosed, q.enqueueValue('?'));
+    try expect(wh.queueIsClosed());
+    wh.release();
+    try expectEqual(0, q.writeHandlesRemaining());
+    danger_zone = false;
+}
+
 fn allocTest(allocator: Allocator) !void {
     // TODO: re-allocate the queues
     const SmolQ = TuQueQue(u8, 6, .{ .notify = .neither, .refcount = false });
     var new_q = try SmolQ.create(allocator);
-    defer new_q.destroy(allocator);
+    defer new_q.errDestroy(allocator);
     new_q.open();
+    const dummy = try allocator.create(usize);
+    defer allocator.destroy(dummy);
     defer new_q.close();
 }
 
