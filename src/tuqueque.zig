@@ -16,7 +16,11 @@
 //! The queues themselves are cache-aligned, and all contended values are
 //! cache-padded onto their own line.  If cache-padded data structures are
 //! used, or if enqueuing otherwise arranges to enqueue data in cache-aligned
-//! blocks, no false sharing will occur.
+//! blocks, no false sharing will occur.  Note that this is purely an efficiency
+//! concern, not a matter of correctness: while you probably don't want 128
+//! threads writing one `u8` apiece, it will work, the data structure is
+//! suitable to use as a byte buffer in the normal case where the mean write is
+//! substantially larger than one byte.
 //!
 //! A `TuQueQue` can be equipped with notifying capability for the reader,
 //! for writers, both, or neither.  Reader-notify provides a variation on the
@@ -36,8 +40,6 @@
 //! is able to grow the halves of the queue, one at a time, if needed.  Use the
 //! API for this, please, the process is fairly involved, and that way `destroy`
 //! can properly free memory even in the event that this has happened.
-//!
-//! TODO: guess I should provide an API for that, huh.
 //!
 //! The main thing to be aware of is that, at any given time, only half of
 //! the capacity is available to the writers at any given point.  The upside
@@ -352,6 +354,14 @@ pub fn TuQueQue(
             }
         }
 
+        /// Destroy the queue without any sanity checks.  Meant to be used
+        /// in an errdefer.
+        pub fn errDestroy(q: *Queue, allocator: Allocator) void {
+            allocator.free(q.queues[0]);
+            allocator.free(q.queues[1]);
+            allocator.destroy(q);
+        }
+
         /// If the queue is closed for writes, this will open it.  Otherwise
         /// it will have no effect.
         pub fn open(q: *Queue) void {
@@ -484,19 +494,27 @@ pub fn TuQueQue(
             return q.enqueuing.load(.monotonic).capacity_remaining == 0;
         }
 
-        /// Return the number of available Cells on a best-effort,
+        /// Return the number of available (written) Cells on a best-effort,
         /// monotonic basis.  There is no guarantee that the next dequeue
-        /// will return all of these messages, and it may return more.
-        /// Tries may error out due to DequeuePending, possibly more than
-        /// once.  A persistent reader will see this many messages after
-        /// enough diligence, and before that happens, a blocking read
-        /// with `dequeue` will not sleep on empty, just pending.
-        pub fn available(q: *Queue) usize {
-            const the_dequeue = q.getAndLockDequeue() catch @panic("Locked dequeue in available()");
+        /// will return all of these messages, and it may return more.  Tries
+        /// may error out due to DequeuePending, possibly more than once.
+        /// A persistent reader will see this many messages after enough
+        /// diligence, and before that happens, a blocking read with `dequeue`
+        /// will not sleep on empty, just pending.
+        pub fn availableDequeues(q: *Queue) usize {
+            const the_dequeue = q.getAndLockDequeue() catch @panic("Locked dequeue in availableDequeues()");
             defer q.dequeuing.store(the_dequeue, .monotonic);
             const the_enqueue = q.enqueuing.load(.monotonic);
             const capacity = q.queues[the_enqueue.index].len;
             return (capacity - the_enqueue.capacity_remaining) + the_dequeue.length_remaining;
+        }
+
+        /// Return the number of Cell slots available before the queue will block.
+        /// It's almost always better to just dequeue.
+        pub fn remainingCapacity(q: *Queue) u62 {
+            const the_dequeue = q.getAndLockDequeue() catch @panic("Locked dequeue in remainingCapacity()");
+            defer q.dequeuing.store(the_dequeue, .monotonic);
+            return q.enqueuing.load(.monotonic).capacity_remaining;
         }
 
         /// Wait the thread without trying for new messages, before or after.
@@ -533,8 +551,12 @@ pub fn TuQueQue(
             }
         };
 
-        pub fn queueCapacity(q: *Queue, which: WhichQueue) usize {
-            const the_dequeue = q.getAndLockDequeue();
+        /// Report the total capacity of either or both queues.  Mainly useful in
+        /// tests, or deciding when to grow / shrink the queue, though a production
+        /// reader may as well keep track of this itself and spare the cache a tiny
+        /// bit of thrashing.
+        pub fn queueTotalCapacity(q: *Queue, which: WhichQueue) usize {
+            const the_dequeue = q.getAndLockDequeue() catch @panic("called queueCapicity on a locked queue");
             defer q.dequeuing.store(the_dequeue, .monotonic);
             const enq = if (which.countEnqueue()) q.queues[the_dequeue.index +% 1].len else 0;
             const deq = if (which.countDequeue()) q.queues[the_dequeue.index].len else 0;
@@ -1109,20 +1131,54 @@ test "pointer casting" {
 }
 
 test "queue basics" {
-    const EzQ = TuQueQue(u8, 128, .{ .notify = .neither, .refcount = false, .secure_erase = false });
+    const EzQ = TuQueQue(u8, 128, .{ .notify = .neither, .refcount = false });
     var new_q = try EzQ.create(talloc);
     defer new_q.destroy(talloc);
     const heyyy = "hello world";
     new_q.open();
     new_q.enqueueSlice(heyyy) catch return expect(false);
-    try expectEqual(heyyy.len, new_q.available());
+    try expectEqual(heyyy.len, new_q.availableDequeues());
     const q_idx1 = new_q.enqueuing.raw.index;
     const hi = new_q.tryDequeue() catch return expect(false);
     const q_idx2 = new_q.enqueuing.raw.index;
-    try expectEqual(0, new_q.available());
+    try expectEqual(0, new_q.availableDequeues());
     try expect(q_idx1 != q_idx2);
     try expectEqualStrings("hello world", hi.?);
     new_q.close();
+}
+
+test "queue full" {
+    const SmolQ = TuQueQue(u8, 6, .{ .notify = .neither, .refcount = false });
+    var new_q = try SmolQ.create(talloc);
+    defer new_q.destroy(talloc);
+    new_q.open();
+    defer new_q.close();
+    try expectEqual(6, new_q.queueTotalCapacity(.both));
+    try expectEqual(3, new_q.queueTotalCapacity(.enqueue));
+    try expectEqual(3, new_q.queueTotalCapacity(.dequeue));
+    new_q.enqueueSlice("ab") catch return expect(false);
+    try expectError(EnqueueErrorSet.NotEnoughRoom, new_q.enqueueSlice("cd"));
+    try expect(!new_q.queueIsFull());
+    try expectEqual(1, new_q.remainingCapacity());
+    new_q.enqueueSlice("c") catch return expect(false);
+    try expectError(EnqueueErrorSet.QueueIsFull, new_q.enqueueSlice("d"));
+    try expectEqual(0, new_q.remainingCapacity());
+    try expect(new_q.queueIsFull());
+    try expectEqualStrings("abc", (new_q.tryDequeue() catch return expect(false)).?);
+    try expectEqual(3, new_q.remainingCapacity());
+}
+
+fn allocTest(allocator: Allocator) !void {
+    // TODO: re-allocate the queues
+    const SmolQ = TuQueQue(u8, 6, .{ .notify = .neither, .refcount = false });
+    var new_q = try SmolQ.create(allocator);
+    defer new_q.destroy(allocator);
+    new_q.open();
+    defer new_q.close();
+}
+
+test "allocation failure" {
+    try testing.checkAllAllocationFailures(talloc, allocTest, .{});
 }
 
 const BACKOFF_LIMIT = 12; // Eventually configurable via option (for thread-san)
@@ -1149,4 +1205,5 @@ const testing = std.testing;
 const expect = testing.expect;
 const expectEqual = testing.expectEqual;
 const expectEqualStrings = testing.expectEqualStrings;
+const expectError = testing.expectError;
 const talloc = testing.allocator;
