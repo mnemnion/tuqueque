@@ -32,7 +32,7 @@ pub fn build(b: *std.Build) void {
     const run_kcov = b.addSystemCommand(&.{
         "kcov",
         "--clean",
-        "--exclude-line=unreachable,expect(false),@panic",
+        "--exclude-line=unreachable,expect(false),@panic, no-coverage",
     });
     run_kcov.setCwd(b.path("."));
     run_kcov.addPrefixedDirectoryArg("--include-pattern=", b.path("src"));
