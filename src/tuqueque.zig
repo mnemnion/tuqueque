@@ -956,6 +956,7 @@ pub fn TuQueQue(
             return .{ q.queues[en_q_ours.index][start..][0..slots], en_q_ours.index };
         }
 
+        /// Try to reserve up to `slots` on the queue, but take whatever we can get.
         fn reserveUpToSliceInternal(q: *Queue, slots: u62) EnqueueError!struct { []Cell, u1, u62 } {
             var this_enqueue: EnqueueToken = undefined;
             var f_minus: usize = 1;
@@ -1293,8 +1294,13 @@ test "WriteHandle" {
     try expectEqualStrings("j", (q.tryDequeue() catch return expect(false)).?);
     try expectEqual(EnqueueErrorSet.QueueIsClosed, wh.enqueueValue('?'));
     try expectEqual(EnqueueErrorSet.QueueIsClosed, q.enqueueValue('?'));
+    try expectEqual(EnqueueErrorSet.QueueIsClosed, q.enqueueUpToSlice("????"));
     try expect(wh.queueIsClosed());
+    q.open();
+    const no_remainder = wh.enqueueUpToSlice("kl") catch return expect(false);
+    try expectEqualStrings("", no_remainder);
     wh.release();
+    q.close();
     try expectEqual(0, q.writeHandlesRemaining());
     danger_zone = false;
 }
@@ -1354,6 +1360,31 @@ fn threadSmokeTests(
             }
         }
 
+        pub fn accumulate(knocker: *KnK) void {
+            sleep(1000); // Give things a chance to catch up.
+            const msg: Message = .{ .want = knocker.want, .got = &knocker.got };
+            work: while (@atomicLoad(u64, &knocker.got, .monotonic) < knocker.want) {
+                var slice: []const Message = &.{ msg, msg, msg };
+                if (knocker.wh.enqueueUpToSlice(slice)) |rem| {
+                    if (rem.len > 0) {
+                        slice = rem;
+                    } else {
+                        continue :work;
+                    }
+                } else |err| {
+                    switch (err) {
+                        Q64.EnqueueError.NotEnoughRoom,
+                        Q64.EnqueueError.QueueIsFull,
+                        => {
+                            sleep(100);
+                        },
+                        Q64.EnqueueError.QueueIsClosed => @panic("queue closed before knock-write"),
+                    }
+                }
+            }
+            knocker.wh.release();
+        }
+
         pub fn reserve(knocker: *KnK) !void {
             sleep(1000); // Give things a chance to catch up.
             const msg: Message = .{ .want = knocker.want, .got = &knocker.got };
@@ -1403,7 +1434,7 @@ fn threadSmokeTests(
 
         const Wat = @This();
 
-        pub fn run(wat: *Wat) !void {
+        pub fn enqueue(wat: *Wat) !void {
             dequeue: while (true) {
                 if (wat.q.tryDequeue()) |m_knocks| {
                     if (m_knocks) |knocks| {
@@ -1436,6 +1467,43 @@ fn threadSmokeTests(
             // Releases can't be counted on until after join
             return;
         }
+
+        pub fn accumulate(wat: *Wat) !void {
+            dequeue: while (true) {
+                if (wat.q.tryDequeue()) |m_knocks| {
+                    if (m_knocks) |knocks| {
+                        for (knocks) |knock| {
+                            const got = @atomicLoad(u64, knock.got, .monotonic);
+                            if (got < knock.want) {
+                                _ = @atomicRmw(u64, knock.got, .Add, 1, .monotonic);
+                            }
+                        }
+                    } else {
+                        if (wat.q.writeHandlesRemaining() == 0) break :dequeue;
+                        try Thread.yield();
+                    }
+                } else |err| {
+                    switch (err) {
+                        DequeErrorSet.DequeueLocked => return expect(false),
+                        DequeErrorSet.DequeueNotEmpty => return expect(false),
+                        DequeErrorSet.DequeuePending => {
+                            sleep(10);
+                        },
+                    }
+                }
+            }
+            wat.q.close();
+            try expectEqual(null, wat.q.tryDequeue() catch return expect(false));
+            sleep(1000);
+            try expectEqual(null, wat.q.tryDequeue() catch return expect(false));
+            return;
+        }
+
+        pub const reserve = enqueue;
+
+        pub fn run(wat: *Wat) !void {
+            return @field(Wat, which)(wat);
+        }
     };
 
     var prng = std.Random.DefaultPrng.init(blk: {
@@ -1460,7 +1528,7 @@ fn threadSmokeTests(
         const want: usize = roll: {
             while (true) {
                 // Evade once-in-history spurious successes:
-                const have = rand.int(u64);
+                const have = if (std.mem.eql(u8, which, "accumulate")) 100 else rand.int(u64);
                 if (have != 0) break :roll have;
             }
         };
@@ -1494,6 +1562,8 @@ test "smoke tests" {
     try threadSmokeTests(4, 16, "reserve");
     try threadSmokeTests(256, 32, "reserve");
     try threadSmokeTests(256, 4, "reserve");
+    try threadSmokeTests(4, 8, "accumulate");
+    try threadSmokeTests(128, 8, "accumulate");
 }
 
 fn allocTest(allocator: Allocator) !void {
