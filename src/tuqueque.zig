@@ -68,7 +68,7 @@
 //! exactly one thread at any given point.  To facilitate this, writes should
 //! come from a `WriteHandle`, this is an erased pointer to the queue which
 //! provides only enqueuing functions.  There is also a dequeue lock which
-//! prevents reader-side reëntrance: if you see a `LockedDequeue` error, that's
+//! prevents reader-side reëntrance: if you see a `DequeueLocked` error, that's
 //! a correctness problem with your program.
 //!
 //! There are several ways a queue can get into an inconsistent state through
@@ -483,7 +483,7 @@ pub fn TuQueQue(
         /// `try q.requeueAfterIndex(i)`, and you'll get it back on
         /// the next dequeue.  Asserts that `i` is `<=` the length of
         /// the returned slice, the only error is if the queue is locked.
-        pub fn requeueAfterIndex(q: *Queue, index: usize) error{LockedDequeue}!void {
+        pub fn requeueAfterIndex(q: *Queue, index: usize) error{DequeueLocked}!void {
             var the_dequeue = try q.getAndLockDequeue();
             const i: u62 = @intCast(index);
             the_dequeue.length_remaining = q.lengths[the_dequeue.index].load(.acquire) - i;
@@ -735,7 +735,7 @@ pub fn TuQueQue(
             /// pointer is made `undefined`.
             pub fn release(wh: *WriteHandle) void {
                 // Probably want to ring the bell unconditionally
-                var q: *Queue = @ptrCast(@alignCast(wh.ptr));
+                var q: *Queue = @ptrCast(@alignCast(wh.ptr)); // if you see 'incorrect alignment'...
                 defer if (comptime reader_notified) q.reader_notify.notify();
                 if (comptime refcounted) {
                     const left = q.writer_refs.fetchSub(1, .release);
@@ -745,7 +745,7 @@ pub fn TuQueQue(
                         @panic("Writer handle reference count underflow, too many releases");
                     }
                 }
-                wh.ptr = undefined;
+                wh.ptr = undefined; // this is why. one release!
             }
         };
 
@@ -762,9 +762,9 @@ pub fn TuQueQue(
         // Loads the dequeue token, erroring out if it's in the locked state.
         // If not, it swaps the locked state in, and returns the current
         // (actual) dequeue state to the caller.
-        fn getAndLockDequeue(q: *Queue) error{LockedDequeue}!DequeueToken {
+        fn getAndLockDequeue(q: *Queue) error{DequeueLocked}!DequeueToken {
             const the_dequeue = q.dequeuing.load(.monotonic);
-            if (the_dequeue == DequeueToken.DEQUEUE_LOCK) return error.LockedDequeue;
+            if (the_dequeue == DequeueToken.DEQUEUE_LOCK) return DequeueError.DequeueLocked;
             return q.dequeuing.swap(DequeueToken.DEQUEUE_LOCK, .monotonic);
         }
 
@@ -779,7 +779,7 @@ pub fn TuQueQue(
                 // We can swap the buffer.  As a correctness aid in development,
                 // let's wipe out the queue we just finished reading.
                 if (is_debug) {
-                    @memset(q.queues[old_dequeue.index], 0xaa);
+                    @memset(q.queues[old_dequeue.index], undefined);
                 }
             }
             // Get the capacity (resizing means this can change from half_cap).
@@ -875,7 +875,7 @@ pub fn TuQueQue(
                     q.resetDequeue(index);
                     return our_slice;
                 } else if (comptime is_debug) {
-                    if (comparison == .eq and committed_length > length_expected) {
+                    if (comparison == .eq and committed_length > length_expected) { // no-coverage
                         @panic("Buffer length should never exceed stored length after a queue swap");
                     }
                     // If this bug slips through to production, it's (relatively!) harmless,
@@ -1071,8 +1071,8 @@ pub const DequeueToken = packed struct(u64) {
         return .{ .index = 1, .length_remaining = 0 };
     }
 
-    pub fn getUnlocked(dqt: DequeueToken) error{LockedDequeue}!DequeueToken {
-        if (dqt == DEQUEUE_LOCK) return error.LockedDequeue;
+    pub fn getUnlocked(dqt: DequeueToken) error{DequeueLocked}!DequeueToken {
+        if (dqt == DEQUEUE_LOCK) return DequeErrorSet.DequeueLocked;
         return dqt;
     }
 };
@@ -1273,6 +1273,7 @@ test "WriteHandle" {
     try expect(q.queueIsFull());
     try expectEqualStrings("abc", (q.tryDequeue() catch return expect(false)).?);
     try expectEqual(3, q.remainingCapacity());
+    try expectEqual(null, (q.tryDequeue() catch return expect(false)));
     const slice = try wh.reserveSlice(3);
     @memcpy(slice, "def");
     wh.commit();
@@ -1286,13 +1287,213 @@ test "WriteHandle" {
     q.requeueAfterIndex(1) catch return expect(false);
     const hi = (q.tryDequeue() catch return expect(false)).?;
     try expectEqualStrings("hi", hi);
+    wh.enqueueValue('j') catch return expect(false);
     q.close();
+    try expect(wh.queueIsClosed());
+    try expectEqualStrings("j", (q.tryDequeue() catch return expect(false)).?);
     try expectEqual(EnqueueErrorSet.QueueIsClosed, wh.enqueueValue('?'));
     try expectEqual(EnqueueErrorSet.QueueIsClosed, q.enqueueValue('?'));
     try expect(wh.queueIsClosed());
     wh.release();
     try expectEqual(0, q.writeHandlesRemaining());
     danger_zone = false;
+}
+
+fn threadSmokeTests(
+    thread_count: comptime_int,
+    queue_cap: comptime_int,
+    comptime which: []const u8,
+) !void {
+    const Message = struct {
+        want: u64,
+        got: *u64,
+    };
+
+    const Q64 = TuQueQue(Message, queue_cap, .{ .notify = .neither, .refcount = true });
+
+    const KnockKnock = struct {
+        want: u64,
+        got: u64 = 0,
+        wh: Q64.WriteHandle,
+
+        const KnK = @This();
+
+        pub fn new(want: u64, wh: Q64.WriteHandle) KnK {
+            return .{ .want = want, .wh = wh };
+        }
+
+        pub fn enqueue(knocker: *KnK) void {
+            // Wait some random amount of time
+            const waiting = knocker.want % 256;
+            sleep(waiting * 100); // up to 25 ms, seems reasonable
+            const msg: Message = .{ .want = knocker.want, .got = &knocker.got };
+            while (true) {
+                if (knocker.wh.enqueueValue(msg)) |_| {
+                    while (true) {
+                        sleep(50);
+                        const got = @atomicLoad(u64, &knocker.got, .monotonic);
+                        if (got == knocker.want) {
+                            knocker.wh.release();
+                            return;
+                        } else if (got != 0) { // no-coverage
+                            logger.err("enqueue: knocker wanted {d} and got {d}\n", .{ knocker.want, knocker.got }); // no-coverage
+                            knocker.wh.release(); // no-coverage
+                            return; // no-coverage
+                        }
+                    }
+                } else |err| {
+                    switch (err) {
+                        Q64.EnqueueError.NotEnoughRoom,
+                        Q64.EnqueueError.QueueIsFull,
+                        => {
+                            sleep(100);
+                        },
+                        Q64.EnqueueError.QueueIsClosed => @panic("queue closed before knock-write"),
+                    }
+                }
+            }
+        }
+
+        pub fn reserve(knocker: *KnK) !void {
+            sleep(1000); // Give things a chance to catch up.
+            const msg: Message = .{ .want = knocker.want, .got = &knocker.got };
+            while (true) {
+                if (knocker.wh.reserveSlice(1)) |slice| {
+                    {
+                        try expect(knocker.wh.reserve.something);
+                        defer knocker.wh.commit();
+                        // Rudely hold on to the reservation.
+                        sleep(150);
+                        slice[0] = msg;
+                    }
+                    try expect(!knocker.wh.reserve.something);
+                    while (true) {
+                        sleep(50);
+                        const got = @atomicLoad(u64, &knocker.got, .monotonic);
+                        if (got == knocker.want) {
+                            knocker.wh.release();
+                            return;
+                        } else if (got != 0) { // no-coverage
+                            logger.err("reserve: knocker wanted {d} and got {d}\n", .{ knocker.want, knocker.got }); // no-coverage
+                            knocker.wh.release(); // no-coverage
+                            return; // no-coverage
+                        }
+                    }
+                } else |err| {
+                    switch (err) {
+                        Q64.EnqueueError.NotEnoughRoom,
+                        Q64.EnqueueError.QueueIsFull,
+                        => {
+                            sleep(100);
+                        },
+                        Q64.EnqueueError.QueueIsClosed => @panic("queue closed before knock-write"),
+                    }
+                }
+            }
+        }
+
+        pub fn run(knocker: *KnK) !void {
+            return @field(KnK, which)(knocker);
+        }
+    };
+
+    const WhoThere = struct {
+        knock_count: usize = 0,
+        q: *Q64,
+
+        const Wat = @This();
+
+        pub fn run(wat: *Wat) !void {
+            dequeue: while (true) {
+                if (wat.q.tryDequeue()) |m_knocks| {
+                    if (m_knocks) |knocks| {
+                        for (knocks) |knock| {
+                            @atomicStore(u64, knock.got, knock.want, .monotonic);
+                            wat.knock_count += 1;
+                        }
+                        if (wat.knock_count == thread_count) {
+                            wat.q.close();
+                            break :dequeue;
+                        } else if (wat.knock_count > thread_count) {
+                            return expectEqualStrings("More knocks", "than threads");
+                        }
+                    } else {
+                        try Thread.yield();
+                    }
+                } else |err| {
+                    switch (err) {
+                        DequeErrorSet.DequeueLocked => return expect(false),
+                        DequeErrorSet.DequeueNotEmpty => return expect(false),
+                        DequeErrorSet.DequeuePending => {
+                            sleep(10);
+                        },
+                    }
+                }
+            }
+            try expectEqual(null, wat.q.tryDequeue() catch return expect(false));
+            sleep(1000);
+            try expectEqual(null, wat.q.tryDequeue() catch return expect(false));
+            // Releases can't be counted on until after join
+            return;
+        }
+    };
+
+    var prng = std.Random.DefaultPrng.init(blk: {
+        var seed: u64 = undefined;
+        try std.posix.getrandom(std.mem.asBytes(&seed));
+        break :blk seed;
+    });
+    const rand = prng.random();
+
+    var danger_zone: bool = true;
+    var knockers: [thread_count]KnockKnock = undefined;
+    const q = try Q64.create(talloc);
+    defer {
+        if (danger_zone) {
+            q.errDestroy(talloc); // no-coverage
+        } else {
+            q.destroy(talloc);
+        }
+    }
+    var wat: WhoThere = .{ .q = q, .knock_count = 0 };
+    for (0..thread_count) |i| {
+        const want: usize = roll: {
+            while (true) {
+                // Evade once-in-history spurious successes:
+                const have = rand.int(u64);
+                if (have != 0) break :roll have;
+            }
+        };
+        knockers[i] = .{ .wh = wat.q.writeHandle(), .want = want, .got = 0 };
+    }
+    wat.q.open();
+    var threads: [thread_count]Thread = undefined;
+    for (0..thread_count) |i| {
+        threads[i] = try Thread.spawn(
+            .{ .stack_size = 1024 * 128 },
+            KnockKnock.run,
+            .{&knockers[i]},
+        );
+    }
+    try wat.run();
+    for (0..thread_count) |i| {
+        threads[i].join();
+    }
+
+    for (0..thread_count) |i| {
+        try expectEqual(knockers[i].want, knockers[i].got);
+    }
+
+    danger_zone = false;
+}
+
+test "smoke tests" {
+    try threadSmokeTests(4, 16, "enqueue");
+    try threadSmokeTests(256, 32, "enqueue");
+    try threadSmokeTests(256, 4, "enqueue");
+    try threadSmokeTests(4, 16, "reserve");
+    try threadSmokeTests(256, 32, "reserve");
+    try threadSmokeTests(256, 4, "reserve");
 }
 
 fn allocTest(allocator: Allocator) !void {
@@ -1323,14 +1524,19 @@ const is_debug = builtin.mode == .Debug;
 const is_safe = is_debug or builtin.mode == .ReleaseSafe;
 const is_test = builtin.is_test;
 
+const logger = std.log.scoped(.tuqueue);
+
 const AtomicOrder = std.builtin.AtomicOrder;
 const cache_line = std.atomic.cache_line;
 const cache_align = std.mem.Alignment.fromByteUnits(cache_line);
 const spinLoopHint = std.atomic.spinLoopHint;
 const Atom = std.atomic.Value; // I prefer it ¯\_(ツ)_/¯
 
-const Condition = std.Thread.Condition;
-const Mutex = std.Thread.Mutex;
+const Thread = std.Thread;
+const Condition = Thread.Condition;
+const Mutex = Thread.Mutex;
+const sleep = Thread.sleep;
+
 const testing = std.testing;
 const expect = testing.expect;
 const expectEqual = testing.expectEqual;
