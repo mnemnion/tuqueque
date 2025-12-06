@@ -729,6 +729,13 @@ pub fn TuQueQue(
                 return q.writeNotifier();
             }
 
+            /// Notify the reader.
+            pub fn notifyReader(wh: *WriteHandle) void {
+                if (comptime !reader_notified) @compileError("Reader is not configured to accept notification");
+                const q: *Queue = @ptrCast(@alignCast(wh.ptr));
+                q.reader_notify.notify();
+            }
+
             /// Check whether the queue is full.  Usually it makes more sense to
             /// just try and enqueue, TOCTOU applies here in both directions.
             /// But it's a coherent writer-side query, so here it is.
@@ -1608,21 +1615,8 @@ fn producerConsumer(queue_cap: comptime_int, stride: comptime_int) !void {
         const ReadMe = @This();
 
         pub fn run(r: *ReadMe, buffer: []u8) !void {
-            var flip = true;
             dequeue: while (true) {
-                defer flip = !flip;
-                if (flip) {
-                    if (r.q.dequeueWithTimeout(1000) catch continue :dequeue) |next| {
-                        if (r.i + next.len <= buffer.len) {
-                            @memcpy(buffer[r.i..][0..next.len], next);
-                        }
-                        r.i += next.len;
-                        if (r.i >= buffer.len) {
-                            break :dequeue;
-                        }
-                    }
-                } else if (false) {
-                    const next = r.q.dequeue();
+                if (r.q.dequeueWithTimeout(1000) catch continue :dequeue) |next| {
                     if (r.i + next.len <= buffer.len) {
                         @memcpy(buffer[r.i..][0..next.len], next);
                     }
@@ -1645,7 +1639,6 @@ fn producerConsumer(queue_cap: comptime_int, stride: comptime_int) !void {
 
         pub fn run(w: *WriteMe) !void {
             var flip: usize = 0;
-            w.w_note.wait();
             enqueue: while (true) {
                 defer flip += 1;
                 const cut = @min(fortuna.len - w.i, stride);
@@ -1684,6 +1677,7 @@ fn producerConsumer(queue_cap: comptime_int, stride: comptime_int) !void {
                 w.i += cut;
                 if (w.i >= fortuna.len) break :enqueue;
             }
+            w.wh.notifyReader();
         }
     };
 
@@ -1699,8 +1693,8 @@ fn producerConsumer(queue_cap: comptime_int, stride: comptime_int) !void {
     q.open();
     var read: Reader = .{ .q = q };
     var write: Writer = .{ .wh = q.writeHandle(), .w_note = q.writeNotifier() };
-    var r_thread = try Thread.spawn(.{}, Reader.run, .{ &read, &buf });
-    var w_thread = try Thread.spawn(.{}, Writer.run, .{&write});
+    var r_thread = try Thread.spawn(.{ .stack_size = 1024 * 128 }, Reader.run, .{ &read, &buf });
+    var w_thread = try Thread.spawn(.{ .stack_size = 1024 * 128 }, Writer.run, .{&write});
     r_thread.join();
     w_thread.join();
     write.wh.release();
@@ -1716,6 +1710,74 @@ test "producer/consumer" {
     try producerConsumer(64, 17);
     try producerConsumer(64, 31);
     try producerConsumer(64, 32);
+}
+
+fn waitSlam(threads: comptime_int, capacity: comptime_int, count: comptime_int) !void {
+    const QSlam = TuQueQue(bool, capacity, .{ .notify = .reader, .secure_erase = true, .refcount = true });
+
+    var threadies: [threads]Thread = undefined;
+    var handles: [threads]QSlam.WriteHandle = undefined;
+
+    const Slammed = struct {
+        q: *QSlam,
+        counter: usize = 0,
+
+        pub fn run(slam: *@This()) !void {
+            slam.q.wait();
+            slam.q.timedWait(10);
+            while (slam.counter < count) {
+                for (slam.q.dequeue()) |_| {
+                    slam.counter += 1;
+                }
+            }
+            slam.q.close();
+        }
+
+        pub fn wh_run(wh: *QSlam.WriteHandle) !void {
+            defer wh.release();
+            while (true) {
+                if (wh.enqueueValue(true)) |_| {} else |err| {
+                    switch (err) {
+                        QSlam.EnqueueError.QueueIsFull, QSlam.EnqueueError.NotEnoughRoom => {},
+                        QSlam.EnqueueError.QueueIsClosed => return,
+                    }
+                }
+            }
+        }
+    };
+    var slammer: Slammed = .{ .q = try QSlam.create(talloc) };
+    slammer.q.open();
+    var danger_zone = true;
+    defer {
+        if (danger_zone) {
+            slammer.q.errDestroy(talloc); // no-coverage
+        } else {
+            slammer.q.destroy(talloc);
+        }
+    }
+    for (0..threads) |i| {
+        handles[i] = slammer.q.writeHandle();
+        threadies[i] = try Thread.spawn(.{ .stack_size = 1024 * 128 }, Slammed.wh_run, .{&handles[i]});
+    }
+
+    const r_handle = try Thread.spawn(.{ .stack_size = 1024 * 128 }, Slammed.run, .{&slammer});
+
+    for (0..threads) |i| {
+        threadies[i].join();
+    }
+    r_handle.join();
+
+    while (slammer.q.writeHandlesRemaining() > 0) {
+        sleep(5); // no-coverage
+    }
+    try expect(true);
+
+    danger_zone = false;
+}
+
+test waitSlam {
+    try waitSlam(128, 20, 100);
+    try waitSlam(256, 20, 10000);
 }
 
 fn allocTest(allocator: Allocator) !void {
@@ -1734,8 +1796,8 @@ test "allocation failure" {
 }
 
 // 19th Fibonacci is 4181, seems reasonable: analogous to 2^12, 4096
-const BACKOFF_LIMIT = if (is_test) 3 else 19; // Eventually configurable via option (for thread-san)
-const SPIN_LIMIT = if (is_test) 1 else 64; // Likewise
+const BACKOFF_LIMIT = if (is_test) 3 else 19;
+const SPIN_LIMIT = if (is_test) 1 else 64;
 
 const std = @import("std");
 const assert = std.debug.assert;

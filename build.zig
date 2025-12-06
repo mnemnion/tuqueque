@@ -33,7 +33,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_module_unit_tests = b.addRunArtifact(module_unit_tests);
-    run_module_unit_tests.has_side_effects = true;
+    run_module_unit_tests.has_side_effects = false;
 
     const test_step = b.step("test", "Run unit tests");
 
