@@ -137,6 +137,11 @@ pub const Notifier = struct {
         return .{ .mut = .{}, .cond = .{} };
     }
 
+    pub fn sequence(note: *Notifier) void {
+        note.mut.lock();
+        note.mut.unlock();
+    }
+
     /// Notify any waiters that it's their turn.
     pub fn notify(note: *Notifier) void {
         // Sequence the mutex:
@@ -173,7 +178,7 @@ pub const Notifier = struct {
         // Drop it again when we return:
         defer note.mut.unlock();
         // Drop and wait for signal or timeout
-        note.cond.timedWait(&note.mut, timeout_ns);
+        note.cond.timedWait(&note.mut, timeout_ns) catch {};
     }
 };
 
@@ -411,9 +416,10 @@ pub fn TuQueQue(
         /// a compile error to call this function.  A TuQueQue type can checked for
         /// this affordance with `TuQueQue(...).writer_notified`, if `true` then
         /// this function will compile when called.
-        pub fn writeNotifier(q: *Queue) Notifier {
+        pub fn writeNotifier(q: *Queue) *Notifier {
             if (!writer_notified) @compileError("Queue is not configured with a write notifier");
-            return q.writer_notify;
+            q.writer_notify.sequence();
+            return &q.writer_notify;
         }
 
         /// Try a dequeue-and-swap.  This can be called whether or not the last
@@ -443,6 +449,9 @@ pub fn TuQueQue(
             if (q.tryDequeue()) |maybe_cells| if (maybe_cells) |cells| {
                 return cells;
             } else { // Nothing yet, so we wait
+                if (comptime writer_notified) {
+                    q.writer_notify.notify();
+                }
                 q.reader_notify.wait();
                 return q.dequeue();
             } else |err| {
@@ -450,9 +459,10 @@ pub fn TuQueQue(
                     DequeueError.DequeuePending => {
                         // Read not completed; we wait
                         q.reader_notify.wait();
-                        return q.dequeuing();
+                        return q.dequeue();
                     },
                     DequeueError.DequeueLocked => @panic("Dequeue was locked within q.dequeue"),
+                    DequeueError.DequeueNotEmpty => unreachable,
                 }
             }
         }
@@ -464,6 +474,9 @@ pub fn TuQueQue(
             if (q.tryDequeue()) |maybe_cells| if (maybe_cells) |cells| {
                 return cells;
             } else { // Nothing yet, so we wait
+                if (comptime writer_notified) {
+                    q.writer_notify.notify();
+                }
                 q.reader_notify.timedWait(timeout_ns);
                 return q.tryDequeue();
             } else |err| {
@@ -473,7 +486,8 @@ pub fn TuQueQue(
                         q.reader_notify.timedWait(timeout_ns);
                         return q.tryDequeue();
                     },
-                    DequeueError.DequeueLocked => |e| return e,
+                    DequeueError.DequeueLocked => |e| return e, // no-coverage
+                    DequeueError.DequeueNotEmpty => unreachable,
                 }
             }
         }
@@ -917,6 +931,10 @@ pub fn TuQueQue(
                 if (this_enqueue.closed) {
                     return EnqueueError.QueueIsClosed;
                 } else if (this_enqueue.capacity_remaining == 0) {
+                    if (reader_notified) {
+                        // Race prevention:
+                        q.reader_notify.notify();
+                    }
                     return EnqueueError.QueueIsFull;
                 }
                 if (this_enqueue.tryReserve(slots)) |en_q_reserve| {
@@ -942,6 +960,10 @@ pub fn TuQueQue(
                         break :busy en_q_reserve;
                     }
                 } else {
+                    if (reader_notified) {
+                        // Race prevention:
+                        q.reader_notify.notify();
+                    }
                     return EnqueueError.NotEnoughRoom;
                 }
             };
@@ -1315,7 +1337,7 @@ fn threadSmokeTests(
         got: *u64,
     };
 
-    const Q64 = TuQueQue(Message, queue_cap, .{ .notify = .neither, .refcount = true });
+    const Q64 = TuQueQue(Message, queue_cap, .{ .notify = .reader, .refcount = true });
 
     const KnockKnock = struct {
         want: u64,
@@ -1436,7 +1458,7 @@ fn threadSmokeTests(
 
         pub fn enqueue(wat: *Wat) !void {
             dequeue: while (true) {
-                if (wat.q.tryDequeue()) |m_knocks| {
+                if (wat.q.dequeueWithTimeout(10)) |m_knocks| {
                     if (m_knocks) |knocks| {
                         for (knocks) |knock| {
                             @atomicStore(u64, knock.got, knock.want, .monotonic);
@@ -1564,6 +1586,136 @@ test "smoke tests" {
     try threadSmokeTests(256, 4, "reserve");
     try threadSmokeTests(4, 8, "accumulate");
     try threadSmokeTests(128, 8, "accumulate");
+}
+
+const fortuna =
+    \\We the unwilling, led by the ungrateful, are doing the impossible.
+    \\We've done so much, for so long, with so little,
+    \\that we are now qualified to do something with nothing.
+    \\
+** 10;
+
+fn producerConsumer(queue_cap: comptime_int, stride: comptime_int) !void {
+    if (stride > queue_cap * 2) @compileError("stride must fit in half queue");
+    const PcQ = TuQueQue(u8, queue_cap, .{ .notify = .both, .refcount = false, .secure_erase = true });
+
+    var buf: [fortuna.len]u8 = undefined;
+
+    const Reader = struct {
+        q: *PcQ,
+        i: usize = 0,
+
+        const ReadMe = @This();
+
+        pub fn run(r: *ReadMe, buffer: []u8) !void {
+            var flip = true;
+            dequeue: while (true) {
+                defer flip = !flip;
+                if (flip) {
+                    if (r.q.dequeueWithTimeout(1000) catch continue :dequeue) |next| {
+                        if (r.i + next.len <= buffer.len) {
+                            @memcpy(buffer[r.i..][0..next.len], next);
+                        }
+                        r.i += next.len;
+                        if (r.i >= buffer.len) {
+                            break :dequeue;
+                        }
+                    }
+                } else if (false) {
+                    const next = r.q.dequeue();
+                    if (r.i + next.len <= buffer.len) {
+                        @memcpy(buffer[r.i..][0..next.len], next);
+                    }
+                    r.i += next.len;
+                    if (r.i >= buffer.len) {
+                        break :dequeue;
+                    }
+                }
+            }
+            r.q.close();
+        }
+    };
+
+    const Writer = struct {
+        wh: PcQ.WriteHandle,
+        i: usize = 0,
+        w_note: *Notifier,
+
+        const WriteMe = @This();
+
+        pub fn run(w: *WriteMe) !void {
+            var flip: usize = 0;
+            w.w_note.wait();
+            enqueue: while (true) {
+                defer flip += 1;
+                const cut = @min(fortuna.len - w.i, stride);
+                var next = fortuna[w.i..][0..cut];
+                if (next.len == 0) break :enqueue;
+                if (flip % 2 == 0) {
+                    w.wh.enqueueSlice(next) catch |err| {
+                        switch (err) {
+                            PcQ.EnqueueError.QueueIsFull,
+                            => {
+                                w.w_note.timedWait(1000);
+                                continue :enqueue;
+                            },
+                            PcQ.EnqueueError.NotEnoughRoom => {
+                                w.w_note.timedWait(1000);
+                                continue :enqueue;
+                            },
+                            PcQ.EnqueueError.QueueIsClosed => return,
+                        }
+                    };
+                } else {
+                    drain: while (next.len > 0) {
+                        next = w.wh.enqueueUpToSlice(next) catch |err| {
+                            switch (err) {
+                                PcQ.EnqueueError.QueueIsFull,
+                                => {
+                                    w.w_note.timedWait(1000);
+                                    continue :drain;
+                                },
+                                PcQ.EnqueueError.NotEnoughRoom => unreachable,
+                                PcQ.EnqueueError.QueueIsClosed => return,
+                            }
+                        };
+                    }
+                }
+                w.i += cut;
+                if (w.i >= fortuna.len) break :enqueue;
+            }
+        }
+    };
+
+    var q = try PcQ.create(talloc);
+    var danger_zone = true;
+    defer {
+        if (danger_zone) {
+            q.errDestroy(talloc); // no-coverage
+        } else {
+            q.destroy(talloc);
+        }
+    }
+    q.open();
+    var read: Reader = .{ .q = q };
+    var write: Writer = .{ .wh = q.writeHandle(), .w_note = q.writeNotifier() };
+    var r_thread = try Thread.spawn(.{}, Reader.run, .{ &read, &buf });
+    var w_thread = try Thread.spawn(.{}, Writer.run, .{&write});
+    r_thread.join();
+    w_thread.join();
+    write.wh.release();
+    q.close();
+    try expectEqualStrings(fortuna, &buf);
+    danger_zone = false;
+}
+
+test "producer/consumer" {
+    try producerConsumer(512, 17);
+    try producerConsumer(256, 17);
+    try producerConsumer(128, 17);
+    try producerConsumer(64, 17);
+    try producerConsumer(64, 31);
+    try producerConsumer(64, 32);
 }
 
 fn allocTest(allocator: Allocator) !void {
