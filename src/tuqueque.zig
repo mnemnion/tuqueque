@@ -230,9 +230,6 @@ const DequeErrorSet = error{
     /// There are writes pending and we can't retrieve them
     /// until they're committed.
     DequeuePending,
-    /// The queue is locked, which only happens during a dequeue.
-    /// The single-reader principle has been violated.
-    DequeueLocked,
     /// An attempt was made to resize the dequeue while contents
     /// remained on it.
     DequeueNotEmpty,
@@ -261,12 +258,11 @@ pub fn TuQueQue(
         @compileError("Not only is this amount of memory unavailable for purchase, we cannot represent it");
 
     const queue_bytes = alignSizeTo(@sizeOf(Cell) * (queue_capacity >> 1), cache_line);
-    _ = queue_bytes;
 
     const half_cap = queue_capacity >> 1;
 
     // Inconveniently-short queues are useful for testing, not in production.
-    const start_cap = if (is_test) half_cap else alignSizeTo(half_cap, cache_line);
+    const start_cap = if (is_test) half_cap else (queue_bytes / half_cap);
 
     return struct {
         /// The status word for enqueuing, always handled with
@@ -280,8 +276,9 @@ pub fn TuQueQue(
         /// one reader is in the wrong, and our code can't know which one that
         /// is.
         dequeuing: CachePad(DequeueToken),
-        /// The lengths of committed writes.  Acquire-release so that read values
-        /// are always current.  Add-only (except on reset), so no contention here.
+        /// The lengths of committed writes.  Acquire-release so that read
+        /// values are always current.  Add-only (except on reset, during the
+        /// next dequeue), so no contention here.
         lengths: [2]CachePad(u62),
         /// The queues.  These are not atomic, because by construction, we
         /// carefully segregate who can write where.  This can lead to false
@@ -292,10 +289,14 @@ pub fn TuQueQue(
         reader_notify: if (reader_notified) Notifier else void,
         /// A Notifier for the writer, if this queue notifies writers.
         writer_notify: if (writer_notified) Notifier else void,
+        /// A reference count of write handles, if this queue counts references.
         writer_refs: if (refcounted) CachePad(usize) else void,
 
         const Queue = @This();
 
+        /// We align the head of both half-queues to the cache, so that even
+        /// sub-cache-aligned data structures can take full advantage of cache-
+        /// line isolation, if desired.
         const CacheCells = []align(cache_line) Cell;
 
         /// Errors visible to a writer (enqueuer)
@@ -347,7 +348,7 @@ pub fn TuQueQue(
         /// released.
         pub fn destroy(q: *Queue, allocator: Allocator) void {
             // Some sanity checks:
-            _ = q.getAndLockDequeue() catch @panic("Queue left in locked state");
+            _ = q.getAndLockDequeue();
             if (comptime refcounted) {
                 const refs = q.writer_refs.load(.acquire);
                 _ = refs; // Refcount debugging, it's a things
@@ -429,15 +430,15 @@ pub fn TuQueQue(
         /// message-containing slice from the queue.  This slice is only valid
         /// until the next call to `tryDequeue`, although some can be requeued
         /// if needed (see `requeueFromIndex`).
-        pub fn tryDequeue(q: *Queue) !?[]Cell {
+        pub fn dequeueAvailable(q: *Queue) !?[]Cell {
             // Invariant: our implementation always unlocks the dequeue when
             // the queue isn't actively accessed from the reader side (this differs
             // from the original).
-            const dequeue_unlocked = try q.getAndLockDequeue();
+            const dequeue_unlocked = q.getAndLockDequeue();
             defer if (is_debug) {
                 assert(q.dequeuing.load(.monotonic) != DequeueToken.DEQUEUE_LOCK);
             };
-            return q.tryDequeueInternal(dequeue_unlocked);
+            return q.dequeueAvailableInternal(dequeue_unlocked);
         }
 
         /// Dequeue messages from the queue, waiting on the Notifier as long as
@@ -446,7 +447,7 @@ pub fn TuQueQue(
         /// DequeueLocked (which should never happen).
         pub fn dequeue(q: *Queue) []Cell {
             if (!reader_notified) @compileError("This queue doesn't notify readers, use tryDequeue");
-            if (q.tryDequeue()) |maybe_cells| if (maybe_cells) |cells| {
+            if (q.dequeueAvailable()) |maybe_cells| if (maybe_cells) |cells| {
                 return cells;
             } else { // Nothing yet, so we wait
                 if (comptime writer_notified) {
@@ -461,7 +462,6 @@ pub fn TuQueQue(
                         q.reader_notify.wait();
                         return q.dequeue();
                     },
-                    DequeueError.DequeueLocked => @panic("Dequeue was locked within q.dequeue"),
                     DequeueError.DequeueNotEmpty => unreachable,
                 }
             }
@@ -471,22 +471,21 @@ pub fn TuQueQue(
         /// `tryDequeue`.  This is a compile error without reader notification configured.
         pub fn dequeueWithTimeout(q: *Queue, timeout_ns: usize) !?[]Cell {
             if (!reader_notified) @compileError("This queue doesn't notify readers, use tryDequeue");
-            if (q.tryDequeue()) |maybe_cells| if (maybe_cells) |cells| {
+            if (q.dequeueAvailable()) |maybe_cells| if (maybe_cells) |cells| {
                 return cells;
             } else { // Nothing yet, so we wait
                 if (comptime writer_notified) {
                     q.writer_notify.notify();
                 }
                 q.reader_notify.timedWait(timeout_ns);
-                return q.tryDequeue();
+                return q.dequeueAvailable();
             } else |err| {
                 switch (err) {
                     DequeueError.DequeuePending => {
                         // Read not completed; we wait
                         q.reader_notify.timedWait(timeout_ns);
-                        return q.tryDequeue();
+                        return q.dequeueAvailable();
                     },
-                    DequeueError.DequeueLocked => |e| return e, // no-coverage
                     DequeueError.DequeueNotEmpty => unreachable,
                 }
             }
@@ -497,8 +496,8 @@ pub fn TuQueQue(
         /// `try q.requeueAfterIndex(i)`, and you'll get it back on
         /// the next dequeue.  Asserts that `i` is `<=` the length of
         /// the returned slice, the only error is if the queue is locked.
-        pub fn requeueAfterIndex(q: *Queue, index: usize) error{DequeueLocked}!void {
-            var the_dequeue = try q.getAndLockDequeue();
+        pub fn requeueAfterIndex(q: *Queue, index: usize) void {
+            var the_dequeue = q.getAndLockDequeue();
             const i: u62 = @intCast(index);
             the_dequeue.length_remaining = q.lengths[the_dequeue.index].load(.acquire) - i;
             // This also unlocks the dequeue
@@ -521,7 +520,7 @@ pub fn TuQueQue(
         /// diligence, and before that happens, a blocking read with `dequeue`
         /// will not sleep on empty, just pending.
         pub fn availableDequeues(q: *Queue) usize {
-            const the_dequeue = q.getAndLockDequeue() catch @panic("Locked dequeue in availableDequeues()");
+            const the_dequeue = q.getAndLockDequeue();
             defer q.dequeuing.store(the_dequeue, .monotonic);
             const the_enqueue = q.enqueuing.load(.monotonic);
             const capacity = q.queues[the_enqueue.index].len;
@@ -531,7 +530,7 @@ pub fn TuQueQue(
         /// Return the number of Cell slots available before the queue will block.
         /// It's almost always better to just dequeue.
         pub fn remainingCapacity(q: *Queue) u62 {
-            const the_dequeue = q.getAndLockDequeue() catch @panic("Locked dequeue in remainingCapacity()");
+            const the_dequeue = q.getAndLockDequeue();
             defer q.dequeuing.store(the_dequeue, .monotonic);
             return q.enqueuing.load(.monotonic).capacity_remaining;
         }
@@ -575,7 +574,7 @@ pub fn TuQueQue(
         /// reader may as well keep track of this itself and spare the cache a tiny
         /// bit of thrashing.
         pub fn queueTotalCapacity(q: *Queue, which: WhichQueue) usize {
-            const the_dequeue = q.getAndLockDequeue() catch @panic("called queueCapicity on a locked queue");
+            const the_dequeue = q.getAndLockDequeue();
             defer q.dequeuing.store(the_dequeue, .monotonic);
             const enq = if (which.countEnqueue()) q.queues[the_dequeue.index +% 1].len else 0;
             const deq = if (which.countDequeue()) q.queues[the_dequeue.index].len else 0;
@@ -590,7 +589,7 @@ pub fn TuQueQue(
             allocator: Allocator,
             new_size: usize,
         ) (DequeueError || Allocator.Error)!void {
-            const the_dequeue = try q.getAndLockDequeue();
+            const the_dequeue = q.getAndLockDequeue();
             defer q.dequeuing.store(the_dequeue, .monotonic);
             if (the_dequeue.length_remaining > 0) return DequeueError.DequeueNotEmpty;
             // TODO: we have to check if this is the posterior queue here
@@ -774,7 +773,7 @@ pub fn TuQueQue(
 
         /// Correct use of this function involves the WriteHandle directly.  Rather than mess around
         /// with a reader-side-specific version of this function, which probably won't be needed,
-        /// readers can always create a WriteHandle and call it that way.
+        /// readers can always create a WriteHandle and call it that way (don't forget to `release`).
         fn reserveSlice(q: *Queue, slots: usize) EnqueueError!struct { WriteHandle.Reservation, []Cell } {
             const our_slice, const index = try q.reserveSliceInternal(@intCast(slots));
             return .{ WriteHandle.Reservation.some(index, slots), our_slice };
@@ -783,13 +782,19 @@ pub fn TuQueQue(
         // Loads the dequeue token, erroring out if it's in the locked state.
         // If not, it swaps the locked state in, and returns the current
         // (actual) dequeue state to the caller.
-        fn getAndLockDequeue(q: *Queue) error{DequeueLocked}!DequeueToken {
+        fn getAndLockDequeue(q: *Queue) DequeueToken {
             const the_dequeue = q.dequeuing.load(.monotonic);
-            if (the_dequeue == DequeueToken.DEQUEUE_LOCK) return DequeueError.DequeueLocked;
+            if (the_dequeue == DequeueToken.DEQUEUE_LOCK) dequeueLockError();
             return q.dequeuing.swap(DequeueToken.DEQUEUE_LOCK, .monotonic);
         }
 
-        fn tryDequeueInternal(q: *Queue, old_dequeue: DequeueToken) DequeueError!?[]Cell {
+        fn dequeueLockError() void { // no-coverage
+            if (is_safe) {
+                @panic("Dequeue was read-locked when reader-side function was called");
+            }
+        }
+
+        fn dequeueAvailableInternal(q: *Queue, old_dequeue: DequeueToken) DequeueError!?[]Cell {
             assert(q.dequeuing.raw == DequeueToken.DEQUEUE_LOCK);
             if (old_dequeue.length_remaining > 0) {
                 // This means we left something in the dequeue.  The canonical reason
@@ -803,7 +808,7 @@ pub fn TuQueQue(
                     @memset(q.queues[old_dequeue.index], undefined);
                 }
             }
-            // Get the capacity (resizing means this can change from half_cap).
+            // Get the capacity (resizing means this can change from `start_cap`).
             // This 'side' is never contended, and only we can change it, so no
             // atomic ordering is needed.
             const next_capacity = q.queues[old_dequeue.index].len;
@@ -876,6 +881,8 @@ pub fn TuQueQue(
             q.dequeuing.store(next_dq, .monotonic);
         }
 
+        /// Wait a while to see if enqueuing will complete in reasonable time, if not, send
+        /// DequeuePending.
         fn dequeueWait(q: *Queue, comparison: Compare, index: u1, length_expected: u62) DequeueError![]Cell {
             // We want an exact match after we swapped, and accept greater-than when we
             // return, because we might have re-queued part of our dequeue buffer.  So
@@ -1039,10 +1046,14 @@ pub fn TuQueQue(
     };
 }
 
-pub const EnqueueToken = packed struct(u64) {
-    index: u1, // Which queue is writing
-    capacity_remaining: u62, // Remaining capacity of that queue
-    closed: bool, // The queue as a whole is closed
+/// Atomic (cache-padded) word representing the enqueue state.
+const EnqueueToken = packed struct(u64) {
+    /// Which queue is the write queue (enqueue).
+    index: u1,
+    /// Remaining capacity of the enqueue.
+    capacity_remaining: u62,
+    /// The queue as a whole is closed.
+    closed: bool,
 
     const LOCK_MASK: u64 = @bitCast(EnqueueToken{ .index = 0, .capacity_remaining = 0, .closed = true });
 
@@ -1076,11 +1087,14 @@ pub const EnqueueToken = packed struct(u64) {
         }
     }
 
+    /// Bit-flip the enqueue closed.  Reserved enqueues will complete, but
+    /// no further writes will succeed.
     pub fn close(e_state: *EnqueueToken, comptime atomic_order: AtomicOrder) void {
         const uptr: *u64 = @ptrCast(@alignCast(e_state));
         _ = @atomicRmw(u64, uptr, .Or, LOCK_MASK, atomic_order);
     }
 
+    /// Bit-flip the enqueue open.
     pub fn open(e_state: *EnqueueToken, comptime atomic_order: AtomicOrder) void {
         const uptr: *u64 = @ptrCast(@alignCast(e_state));
         _ = @atomicRmw(u64, uptr, .And, ~LOCK_MASK, atomic_order);
@@ -1247,7 +1261,7 @@ test "queue basics" {
     new_q.enqueueSlice(heyyy) catch return expect(false);
     try expectEqual(heyyy.len, new_q.availableDequeues());
     const q_idx1 = new_q.enqueuing.raw.index;
-    const hi = new_q.tryDequeue() catch return expect(false);
+    const hi = new_q.dequeueAvailable() catch return expect(false);
     const q_idx2 = new_q.enqueuing.raw.index;
     try expectEqual(0, new_q.availableDequeues());
     try expect(q_idx1 != q_idx2);
@@ -1272,7 +1286,7 @@ test "queue full" {
     try expectError(EnqueueErrorSet.QueueIsFull, new_q.enqueueSlice("d"));
     try expectEqual(0, new_q.remainingCapacity());
     try expect(new_q.queueIsFull());
-    try expectEqualStrings("abc", (new_q.tryDequeue() catch return expect(false)).?);
+    try expectEqualStrings("abc", (new_q.dequeueAvailable() catch return expect(false)).?);
     try expectEqual(3, new_q.remainingCapacity());
 }
 
@@ -1301,26 +1315,26 @@ test "WriteHandle" {
     try expectError(EnqueueErrorSet.QueueIsFull, q.enqueueSlice("d"));
     try expectEqual(0, q.remainingCapacity());
     try expect(q.queueIsFull());
-    try expectEqualStrings("abc", (q.tryDequeue() catch return expect(false)).?);
+    try expectEqualStrings("abc", (q.dequeueAvailable() catch return expect(false)).?);
     try expectEqual(3, q.remainingCapacity());
-    try expectEqual(null, (q.tryDequeue() catch return expect(false)));
+    try expectEqual(null, (q.dequeueAvailable() catch return expect(false)));
     const slice = try wh.reserveSlice(3);
     @memcpy(slice, "def");
     wh.commit();
     try expect(wh.queueIsFull());
-    try expectEqualStrings("def", (q.tryDequeue() catch return expect(false)).?);
+    try expectEqualStrings("def", (q.dequeueAvailable() catch return expect(false)).?);
     const remains = wh.enqueueUpToSlice("ghij") catch return expect(false);
     try expectEqualStrings("j", remains);
     try expect(wh.queueIsFull());
-    const ghi = (q.tryDequeue() catch return expect(false)).?;
+    const ghi = (q.dequeueAvailable() catch return expect(false)).?;
     try expectEqualStrings("ghi", ghi);
-    q.requeueAfterIndex(1) catch return expect(false);
-    const hi = (q.tryDequeue() catch return expect(false)).?;
+    q.requeueAfterIndex(1);
+    const hi = (q.dequeueAvailable() catch return expect(false)).?;
     try expectEqualStrings("hi", hi);
     wh.enqueueValue('j') catch return expect(false);
     q.close();
     try expect(wh.queueIsClosed());
-    try expectEqualStrings("j", (q.tryDequeue() catch return expect(false)).?);
+    try expectEqualStrings("j", (q.dequeueAvailable() catch return expect(false)).?);
     try expectEqual(EnqueueErrorSet.QueueIsClosed, wh.enqueueValue('?'));
     try expectEqual(EnqueueErrorSet.QueueIsClosed, q.enqueueValue('?'));
     try expectEqual(EnqueueErrorSet.QueueIsClosed, q.enqueueUpToSlice("????"));
@@ -1482,7 +1496,6 @@ fn threadSmokeTests(
                     }
                 } else |err| {
                     switch (err) {
-                        DequeErrorSet.DequeueLocked => return expect(false),
                         DequeErrorSet.DequeueNotEmpty => return expect(false),
                         DequeErrorSet.DequeuePending => {
                             sleep(10);
@@ -1490,16 +1503,16 @@ fn threadSmokeTests(
                     }
                 }
             }
-            try expectEqual(null, wat.q.tryDequeue() catch return expect(false));
+            try expectEqual(null, wat.q.dequeueAvailable() catch return expect(false));
             sleep(1000);
-            try expectEqual(null, wat.q.tryDequeue() catch return expect(false));
+            try expectEqual(null, wat.q.dequeueAvailable() catch return expect(false));
             // Releases can't be counted on until after join
             return;
         }
 
         pub fn accumulate(wat: *Wat) !void {
             dequeue: while (true) {
-                if (wat.q.tryDequeue()) |m_knocks| {
+                if (wat.q.dequeueAvailable()) |m_knocks| {
                     if (m_knocks) |knocks| {
                         for (knocks) |knock| {
                             const got = @atomicLoad(u64, knock.got, .monotonic);
@@ -1513,7 +1526,6 @@ fn threadSmokeTests(
                     }
                 } else |err| {
                     switch (err) {
-                        DequeErrorSet.DequeueLocked => return expect(false),
                         DequeErrorSet.DequeueNotEmpty => return expect(false),
                         DequeErrorSet.DequeuePending => {
                             sleep(10);
@@ -1522,9 +1534,9 @@ fn threadSmokeTests(
                 }
             }
             wat.q.close();
-            try expectEqual(null, wat.q.tryDequeue() catch return expect(false));
+            try expectEqual(null, wat.q.dequeueAvailable() catch return expect(false));
             sleep(1000);
-            try expectEqual(null, wat.q.tryDequeue() catch return expect(false));
+            try expectEqual(null, wat.q.dequeueAvailable() catch return expect(false));
             return;
         }
 
