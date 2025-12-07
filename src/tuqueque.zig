@@ -430,7 +430,7 @@ pub fn TuQueQue(
         /// message-containing slice from the queue.  This slice is only valid
         /// until the next call to `tryDequeue`, although some can be requeued
         /// if needed (see `requeueFromIndex`).
-        pub fn dequeueAvailable(q: *Queue) !?[]Cell {
+        pub fn dequeueAvailable(q: *Queue) error{DequeuePending}!?[]Cell {
             // Invariant: our implementation always unlocks the dequeue when
             // the queue isn't actively accessed from the reader side (this differs
             // from the original).
@@ -443,10 +443,9 @@ pub fn TuQueQue(
 
         /// Dequeue messages from the queue, waiting on the Notifier as long as
         /// necessary.  This function is a compile error if reader notification is
-        /// not configured.  To allow it to be error-free, this panics if it sees
-        /// DequeueLocked (which should never happen).
-        pub fn dequeue(q: *Queue) []Cell {
-            if (!reader_notified) @compileError("This queue doesn't notify readers, use tryDequeue");
+        /// not configured.
+        pub fn dequeueWait(q: *Queue) []Cell {
+            if (!reader_notified) @compileError("This queue doesn't notify readers, use dequeueAvailable");
             if (q.dequeueAvailable()) |maybe_cells| if (maybe_cells) |cells| {
                 return cells;
             } else { // Nothing yet, so we wait
@@ -454,15 +453,14 @@ pub fn TuQueQue(
                     q.writer_notify.notify();
                 }
                 q.reader_notify.wait();
-                return q.dequeue();
+                return q.dequeueWait();
             } else |err| {
                 switch (err) {
-                    DequeueError.DequeuePending => {
+                    error.DequeuePending => {
                         // Read not completed; we wait
                         q.reader_notify.wait();
-                        return q.dequeue();
+                        return q.dequeueWait();
                     },
-                    DequeueError.DequeueNotEmpty => unreachable,
                 }
             }
         }
@@ -481,12 +479,11 @@ pub fn TuQueQue(
                 return q.dequeueAvailable();
             } else |err| {
                 switch (err) {
-                    DequeueError.DequeuePending => {
+                    error.DequeuePending => {
                         // Read not completed; we wait
                         q.reader_notify.timedWait(timeout_ns);
                         return q.dequeueAvailable();
                     },
-                    DequeueError.DequeueNotEmpty => unreachable,
                 }
             }
         }
@@ -515,7 +512,7 @@ pub fn TuQueQue(
         /// Return the number of available (written) Cells on a best-effort,
         /// monotonic basis.  There is no guarantee that the next dequeue
         /// will return all of these messages, and it may return more.  Tries
-        /// may error out due to DequeuePending, possibly more than once.
+        /// may error out due to `DequeuePending`, possibly more than once.
         /// A persistent reader will see this many messages after enough
         /// diligence, and before that happens, a blocking read with `dequeue`
         /// will not sleep on empty, just pending.
@@ -527,7 +524,7 @@ pub fn TuQueQue(
             return (capacity - the_enqueue.capacity_remaining) + the_dequeue.length_remaining;
         }
 
-        /// Return the number of Cell slots available before the queue will block.
+        /// Return the number of `Cell` slots available before the queue will block.
         /// It's almost always better to just dequeue.
         pub fn remainingCapacity(q: *Queue) u62 {
             const the_dequeue = q.getAndLockDequeue();
@@ -547,6 +544,12 @@ pub fn TuQueQue(
         pub fn timedWait(q: *Queue, timeout_ns: usize) void {
             if (!reader_notified) @compileError("Can't wait without a notifier");
             q.reader_notify.timedWait(timeout_ns);
+        }
+
+        /// Notify the write-side Notifier.
+        pub fn notifyWriter(q: *Queue) void {
+            if (!writer_notified) @compileError("Can't wait without a notifier");
+            q.writer_notify.notify();
         }
 
         const WhichQueue = enum {
@@ -598,11 +601,12 @@ pub fn TuQueQue(
 
         //| Writer API
         //|
-        //| Writers should request and use a WriteHandle, in preference to sharing 'public'
-        //| references to the queue itself (owned by the reader).
+        //| Writers should request and use a `WriteHandle`, in preference to
+        //| sharing references to the queue itself (owned by the reader).
         //|
-        //| However, these methods are public, because a read-thread enqueuing something for
-        //| later is a coherent action, and not even an uncommon one.
+        //| However, these methods are public, because a read-thread enqueuing
+        //| something for later is a coherent action, and not even an uncommon
+        //| one.
 
         /// Attempt to enqueue one value of Cell.  Errors if there isn't room.
         pub fn enqueueValue(q: *Queue, val: Cell) EnqueueError!void {
@@ -645,8 +649,9 @@ pub fn TuQueQue(
             ptr: *anyopaque,
             reserve: Reservation = .None,
 
-            // Zig doesn't have niche-optimizations for most values yet,
-            // so we fake it:
+            // Zig doesn't have niche-optimizations for most values yet, so we
+            // fake it.  Someday this will be a `?packed struct(u63)`, with no
+            // changes to the emitted machine code expected.
 
             /// A reservation.  When a WriteHandle grabs a slice, the reservation
             /// is set, and used to commit the write to the queue.  Always commit!
@@ -688,7 +693,7 @@ pub fn TuQueQue(
             /// write is done and the WriteHandle calls `wh.commit()`.  Only one
             /// slot can be reserved at a time by any given writer. `[more]`
             ///
-            /// Use of the function can leak prior contents of the queue, which
+            /// Use of this function can leak prior contents of the queue, which
             /// can be a security risk in some applications.  If configured with
             /// the `secure_erase` option, the slice will always be filled with
             /// zeroes before returning it.
@@ -794,13 +799,13 @@ pub fn TuQueQue(
             }
         }
 
-        fn dequeueAvailableInternal(q: *Queue, old_dequeue: DequeueToken) DequeueError!?[]Cell {
+        fn dequeueAvailableInternal(q: *Queue, old_dequeue: DequeueToken) error{DequeuePending}!?[]Cell {
             assert(q.dequeuing.raw == DequeueToken.DEQUEUE_LOCK);
             if (old_dequeue.length_remaining > 0) {
                 // This means we left something in the dequeue.  The canonical reason
                 // this might happen is that we timed out on a previous try, but we
                 // may also have requeued some of it.
-                return try q.dequeueWait(.gte, old_dequeue.index, old_dequeue.length_remaining);
+                return try q.dequeueAwaitWrites(.gte, old_dequeue.index, old_dequeue.length_remaining);
             } else {
                 // We can swap the buffer.  As a correctness aid in development,
                 // let's wipe out the queue we just finished reading.
@@ -853,11 +858,11 @@ pub fn TuQueQue(
             const this_len = q.lengths[new_dq_index].load(.acquire);
             switch (order(this_len + old_enqueue.capacity_remaining, total_capacity)) {
                 .lt => {
-                    // We have some writes in-flight, deal with it
+                    // We have some writes in-flight, deal with it.
                     // We expect the exact length, which is: total capacity
                     // - capacity remaining.  We know this won't underflow.
                     const length_expected = total_capacity - old_enqueue.capacity_remaining;
-                    return try q.dequeueWait(.eq, old_enqueue.index, @intCast(length_expected));
+                    return try q.dequeueAwaitWrites(.eq, old_enqueue.index, @intCast(length_expected));
                 },
                 .eq => {
                     // We may take our slice, but first, commit the dequeue state.
@@ -883,7 +888,7 @@ pub fn TuQueQue(
 
         /// Wait a while to see if enqueuing will complete in reasonable time, if not, send
         /// DequeuePending.
-        fn dequeueWait(q: *Queue, comparison: Compare, index: u1, length_expected: u62) DequeueError![]Cell {
+        fn dequeueAwaitWrites(q: *Queue, comparison: Compare, index: u1, length_expected: u62) error{DequeuePending}![]Cell {
             // We want an exact match after we swapped, and accept greater-than when we
             // return, because we might have re-queued part of our dequeue buffer.  So
             // we pass in a comparison.
@@ -1496,8 +1501,7 @@ fn threadSmokeTests(
                     }
                 } else |err| {
                     switch (err) {
-                        DequeErrorSet.DequeueNotEmpty => return expect(false),
-                        DequeErrorSet.DequeuePending => {
+                        error.DequeuePending => {
                             sleep(10);
                         },
                     }
@@ -1526,8 +1530,7 @@ fn threadSmokeTests(
                     }
                 } else |err| {
                     switch (err) {
-                        DequeErrorSet.DequeueNotEmpty => return expect(false),
-                        DequeErrorSet.DequeuePending => {
+                        error.DequeuePending => {
                             sleep(10);
                         },
                     }
@@ -1627,6 +1630,7 @@ fn producerConsumer(queue_cap: comptime_int, stride: comptime_int) !void {
         const ReadMe = @This();
 
         pub fn run(r: *ReadMe, buffer: []u8) !void {
+            r.q.notifyWriter();
             dequeue: while (true) {
                 if (r.q.dequeueWithTimeout(1000) catch continue :dequeue) |next| {
                     if (r.i + next.len <= buffer.len) {
@@ -1738,7 +1742,7 @@ fn waitSlam(threads: comptime_int, capacity: comptime_int, count: comptime_int) 
             slam.q.wait();
             slam.q.timedWait(10);
             while (slam.counter < count) {
-                for (slam.q.dequeue()) |_| {
+                for (slam.q.dequeueWait()) |_| {
                     slam.counter += 1;
                 }
             }
