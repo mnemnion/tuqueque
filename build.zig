@@ -6,13 +6,19 @@ pub fn build(b: *std.Build) void {
 
     const optimize = b.standardOptimizeOption(.{});
 
+    const opts = b.addOptions();
+    opts.addOption(?usize, "custom_alignment", b.option(
+        usize,
+        "custom_alignment",
+        "Use a custom amount of padding to isolate atomic variables",
+    ));
+
     const tuqueque_mod = b.addModule("tuqueque", .{
         .root_source_file = b.path("src/tuqueque.zig"),
         .target = target,
         .optimize = optimize,
     });
-
-    _ = tuqueque_mod;
+    tuqueque_mod.addOptions("options", opts);
 
     const test_filters = b.option(
         []const []const u8,
@@ -26,6 +32,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .sanitize_thread = true,
     });
+    tuqueque_test_mod.addOptions("options", opts);
 
     const module_unit_tests = b.addTest(.{
         .root_module = tuqueque_test_mod,

@@ -262,7 +262,7 @@ pub fn TuQueQue(
     const half_cap = queue_capacity >> 1;
 
     // Inconveniently-short queues are useful for testing, not in production.
-    const start_cap = if (is_test) half_cap else (queue_bytes / half_cap);
+    const start_cap = if (is_test) half_cap else (queue_bytes / @sizeOf(Cell));
 
     return struct {
         /// The status word for enqueuing, always handled with
@@ -304,6 +304,10 @@ pub fn TuQueQue(
         /// Errors visible to a reader (dequeuer)
         pub const DequeueError = DequeErrorSet;
 
+        /// The actual capacity each queue begins with, which may be
+        /// more than `queue_capacity / 2` due to cache alignment.
+        pub const each_queue_initial_capacity = start_cap;
+
         /// Does this type notify readers?
         pub const reader_notified: bool = opt.notify.notifyReader();
         /// Does this type notify writers?
@@ -313,6 +317,11 @@ pub fn TuQueQue(
         /// Does this type secure-erase reserved slices?
         pub const secure_erased: bool = opt.secure_erase;
 
+        const bytes_total = @sizeOf(Queue) + 2 * queue_bytes;
+
+        const q0_offset = @sizeOf(Queue);
+        const q1_offset = q0_offset + queue_bytes;
+
         //| Reader API
         //|
         //| User code must preserve the **one reader invariant**.  Errors will
@@ -320,13 +329,11 @@ pub fn TuQueQue(
 
         /// Create a new swap-buffer queue.  The queue returned will be closed
         /// for writes.  Destroy when finished with `q.destroy(allocator)`.
-        pub fn create(allocator: Allocator) Allocator.Error!*Queue {
-            // TODO: We will allocate all the starting capacity in one
-            // block, putting the TuQueQue at the head of it and making
-            // the swap queues on the tail.  And align the whole thing.
-            // But that all can wait until what we have is tested.
-            const q = try allocator.create(Queue);
-            errdefer allocator.destroy(q);
+        pub fn create(allocator: Allocator) Allocator.Error!*align(cache_line) Queue {
+            var q_raw = try allocator.alignedAlloc(u8, cache_align, bytes_total);
+            var q: *align(cache_line) Queue = @ptrCast(@alignCast(q_raw));
+            errdefer allocator.free(q_raw);
+            errdefer comptime unreachable;
             q.enqueuing.raw = EnqueueToken.new(start_cap);
             q.dequeuing.raw = DequeueToken.new();
             q.lengths[0].raw = 0;
@@ -334,12 +341,12 @@ pub fn TuQueQue(
             q.reader_notify = if (reader_notified) Notifier.new() else {};
             q.writer_notify = if (writer_notified) Notifier.new() else {};
             q.writer_refs = if (refcounted) .{ .raw = 0 } else {};
-            q.queues[0] = try allocator.alignedAlloc(Cell, cache_align, start_cap);
-            // q.queues[0] = try allocator.alloc(Cell, start_cap);
-            errdefer allocator.free(q.queues[0]);
-            q.queues[1] = try allocator.alignedAlloc(Cell, cache_align, start_cap);
-            // q.queues[1] = try allocator.alloc(Cell, start_cap);
-            errdefer comptime unreachable;
+            const queue_0_raw = q_raw[@sizeOf(Queue)..][0 .. start_cap * @sizeOf(Cell)];
+            q.queues[0] = std.mem.bytesAsSlice(Cell, queue_0_raw);
+            assert(q.queues[0].len == start_cap);
+            const queue_1_raw = q_raw[@sizeOf(Queue) + queue_bytes ..][0 .. start_cap * @sizeOf(Cell)];
+            q.queues[1] = std.mem.bytesAsSlice(Cell, queue_1_raw);
+            assert(q.queues[1].len == start_cap);
             return q;
         }
 
@@ -351,13 +358,11 @@ pub fn TuQueQue(
             _ = q.getAndLockDequeue();
             if (comptime refcounted) {
                 const refs = q.writer_refs.load(.acquire);
-                _ = refs; // Refcount debugging, it's a things
+                _ = refs; // Refcount debugging, it's a thing
                 assert(q.writer_refs.load(.acquire) == 0);
             }
             if (q.enqueuing.load(.acquire).closed) {
-                allocator.free(q.queues[0]);
-                allocator.free(q.queues[1]);
-                allocator.destroy(q);
+                q.errDestroy(allocator);
             } else {
                 @panic("The queue must be closed before it can be destroyed");
             }
@@ -366,9 +371,15 @@ pub fn TuQueQue(
         /// Destroy the queue without any sanity checks.  Meant to be used
         /// in an errdefer.
         pub fn errDestroy(q: *Queue, allocator: Allocator) void {
-            allocator.free(q.queues[0]);
-            allocator.free(q.queues[1]);
-            allocator.destroy(q);
+            if (@intFromPtr(q) + q0_offset != @intFromPtr(q.queues[0].ptr)) {
+                allocator.free(q.queues[0]);
+            }
+            if (@intFromPtr(q) + q1_offset != @intFromPtr(q.queues[1].ptr)) {
+                allocator.free(q.queues[1]);
+            }
+            var as_bytes: []align(cache_line) u8 = std.mem.asBytes(q);
+            as_bytes.len = bytes_total;
+            allocator.free(as_bytes);
         }
 
         /// If the queue is closed for writes, this will open it.  Otherwise
@@ -595,8 +606,12 @@ pub fn TuQueQue(
             const the_dequeue = q.getAndLockDequeue();
             defer q.dequeuing.store(the_dequeue, .monotonic);
             if (the_dequeue.length_remaining > 0) return DequeueError.DequeueNotEmpty;
-            // TODO: we have to check if this is the posterior queue here
-            q.queues[the_dequeue.index] = try allocator.realloc(q.queues[the_dequeue.index], new_size);
+            const dq_offset = if (the_dequeue.index == 0) q0_offset else q1_offset;
+            if (@intFromPtr(q.queues[the_dequeue.index].ptr) == @intFromPtr(q) + dq_offset) {
+                q.queues[the_dequeue.index] = try allocator.alignedAlloc(Cell, cache_align, new_size);
+            } else {
+                q.queues[the_dequeue.index] = try allocator.realloc(q.queues[the_dequeue.index], new_size);
+            }
         }
 
         //| Writer API
@@ -1240,7 +1255,7 @@ test alignSizeTo {
 }
 
 test "alignment" {
-    try expectEqual(std.atomic.cache_line, @sizeOf(CachePad(usize)));
+    try expectEqual(cache_line, @sizeOf(CachePad(usize)));
 }
 
 test "pointer casting" {
@@ -1805,9 +1820,20 @@ fn allocTest(allocator: Allocator) !void {
     const dummy = try allocator.create(usize);
     defer allocator.destroy(dummy);
     defer new_q.close();
+    try expectEqual(6, new_q.queueTotalCapacity(.both));
+    try new_q.resizeDequeuedHalf(allocator, 12);
+    try expectEqual(15, new_q.queueTotalCapacity(.both));
+    try expectEqual(12, new_q.queueTotalCapacity(.dequeue));
+    try expectEqual(null, new_q.dequeueAvailable() catch return expect(false));
+    try new_q.resizeDequeuedHalf(allocator, 18);
+    try expectEqual(12 + 18, new_q.queueTotalCapacity(.both));
+    try expectEqual(18, new_q.queueTotalCapacity(.dequeue));
+    try new_q.resizeDequeuedHalf(allocator, 10);
+    try expectEqual(12 + 10, new_q.queueTotalCapacity(.both));
+    try expectEqual(10, new_q.queueTotalCapacity(.dequeue));
 }
 
-test "allocation failure" {
+test " failure" {
     try testing.checkAllAllocationFailures(talloc, allocTest, .{});
 }
 
@@ -1824,10 +1850,12 @@ const is_debug = builtin.mode == .Debug;
 const is_safe = is_debug or builtin.mode == .ReleaseSafe;
 const is_test = builtin.is_test;
 
+const options = @import("options");
+
 const logger = std.log.scoped(.tuqueue);
 
 const AtomicOrder = std.builtin.AtomicOrder;
-const cache_line = std.atomic.cache_line;
+const cache_line = options.custom_alignment orelse std.atomic.cache_line;
 const cache_align = std.mem.Alignment.fromByteUnits(cache_line);
 const spinLoopHint = std.atomic.spinLoopHint;
 const Atom = std.atomic.Value; // I prefer it ¯\_(ツ)_/¯

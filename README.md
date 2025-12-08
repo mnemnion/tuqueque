@@ -288,32 +288,52 @@ work if growth is consistent.  For 'bursty' workloads, especially ones
 which move housekeeping out of the hot path (examples: logging, database
 transactions), it could perform very well.
 
+If you think in terms of the derivative, the size of the queue is of
+minor importance.  Either the reader finishes a half before the other
+fills (reads > writes), it's about the same (reads ≅ writes, the
+'butter zone'), or the queue fills and blocks (writes > reads), and
+you're in trouble, unless that condition is temporary.  Longer queues
+buy you some flexibility, but the governing equation is as simple as it
+is stern.
+
 A `TuQueQue` queque is quite well-suited to SPSC work, which is after
-all just a special case of MPSC where `M == 1`.  Just don't rely on
-the built-in `Condition` notifications alone, it takes more than that
-to avoid deadlock races[^✤].  If you're certain the workload will be
-SPSC, it may be that something more specialized to that purpose will
-suit your needs better.  Then again, maybe not!  It's very good at what
-it does.
+all just a special case of MPSC where `M == 1`.  Just don't rely on the
+built-in `Notifier`s alone, it takes more than that to avoid deadlock
+races[^✤].  If you're certain the workload will be SPSC, it may be
+that something more specialized to that purpose will suit your needs
+better.  Then again, maybe not!  It's very good at what it does.
 
 Every atomic value in a `TuQueQue` is isolated on its own cache line,
 to prevent false sharing.  The queues are also cache-aligned, one
-consequence is that your starting capacity might be somewhat larger
-than what was requested.  Writes can occur into the same cache line
+consequence is that your starting capacity might be somewhat larger than
+what was requested[^✽] .  Writes can occur into the same cache line
 however, in fact this would be normal for small writes, and depending
 on specifics this might noticeably impact performance.  This can be
 avoided, when suitable, by padding the data type used out to fill its
 own cache line.  Since the queues themselves always start at the start
 of a cache line, this will work.
 
+On some ARM systems (not Apple ones) the padding needed for effective
+CAS operations is larger than the cache line.  This can be configured
+with the build option `custom_alignment`.  Search string: "exclusive
+reservation granule".  While we're on the subject: it would be
+surprising if this library functioned correctly on 32-bit systems.
+
 There are a whole host of queries included, answering questions about
-capacity, messages available, and so on.  These are debugging aids.
-Using them in production produces read contention on critical atomic
-values, and the right way to find out how many messages you can get is
-to dequeue them.  It's no great challenge to track the capacity of the
-queue halves locally, detect the case of most or all of it getting used,
-then employ a simple state machine to grow / shrink both halves over the
-ordinary course of message processing.
+capacity, messages available, and so on.  These are intended primarily
+as debugging aids, also useful for orderly startup and shutdown.  Using
+them in-flight produces read contention on critical atomic values, and
+the right way to find out how many messages you can get is to dequeue
+them.  It's no great challenge to track the capacity of the queue halves
+locally, detect the case of most or all of it getting used, then employ
+a simple state machine to grow / shrink both halves over the ordinary
+course of message processing.
+
+Just, think of it this way: if you grow a queue to catch more writes,
+that's debt.  The reader already has more than it can handle, more
+or less by definition, and if that keeps up, the queue will just
+keep growing, and things will go pear-shaped in the fulness of time.
+Consider making `QueueIsFull` errors a writer-side problem to deal with.
 
 [^†]: Like the cognitive fallacy.  Pronounced _tu-**kyu**-kway_, if
 possible.  You can also say _¿Tu que que?_, but you had better know who
@@ -338,3 +358,8 @@ case from `error.QueueIsFull`.  Corollary: if you're not sure, use
 
 [^✤]: Just as true for MPSC, but somehow less tempting.  Threads are
 not coroutines!
+
+[^✽]: Resizes get exactly what they ask for, for sane book-keeping.
+Just know that rounding up to the cache-line boundary is free, in that
+any sane allocator will round the allocation at least to the alignment,
+so the slice you get back may as well access the full allocation.
