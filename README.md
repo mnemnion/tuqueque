@@ -16,7 +16,9 @@ queue is full.
 
 At any instant, the reader (singular!) can dequeue, by swapping which
 queue is which.  Writes may not be committed, in which case the reader
-must wait until they are; this can time out.
+must wait until they are.  This can time out, but in the absence of
+enqueue-side use bugs, the dequeue will eventualy succeed, and no
+further writes will be reserved to that side after a swap.
 
 Once it succeeds, the reader has a slice of whatever the queue carries.
 It can do reader stuff with the slice, and (after reading, please!)
@@ -28,7 +30,7 @@ Tuned appropriately, this is about as good as it gets.  All common
 memory is handled atomically, and cache-isolated to eliminate false
 sharing.
 
-The most important invariant is that there **must** only be one
+The most important invariant is that there **must** _only_ be one
 reader.  To facilitate this, writes are expected to proceed using a
 `WriteHandle`, a type-erased pointer to the queue exposing only the
 write-appropriate functions (and a bit of bookkeeping, it's two words
@@ -54,7 +56,11 @@ with no benchmarks.
 
 ## Installation
 
-<tk blah blah>
+`TuQueQue` requires Zig `0.15.2`.
+
+```sh
+zig fetch --save "https://github.com/mnemnion/tuqueque/archive/refs/tags/v0.0.1.tar.gz"
+```
 
 ## Use
 
@@ -89,15 +95,15 @@ A simple read loop might look something like this:
 ```zig
 dequeue: while (true) {
     if (reader.q.dequeueAvailable()) |maybe_msgs| {
-        if (msgs) |msgs| {
+        if (maybe_msgs) |msgs| {
             for (msgs) |msg| {
                 reader.doMessageThing(msg);
             }
             continue :dequeue;
         } else {
-            // Nothing in the queue for the last millisecond
+            // Nothing in the queue at time-of-check
             reader.doSomethingElse();
-            if (reader.isDone()) break :dequeue;
+            if (reader.done()) break :dequeue;
             continue :dequeue;
         }
     } else |err| {
@@ -118,7 +124,7 @@ dequeue: while (true) {
             reader.doMessageThings(msg);
         }
         if (reader.done()) break :dequeue;
-    }
+    } // Nothing after one ms and two tries
 }
 ```
 
@@ -177,13 +183,14 @@ If reference counting is enabled (by default, no), a count of
 `writeHandle` calls is kept, and `w.release()` will decrement it.
 `q.destroy()` (but not `q.errDestroy()`) will panic if this count is not
 zero.  This is intended as a useful building block, and sanity check,
-but is not a complete, nor even necessarily a part of, a system to take
-down a multithreaded program in an orderly manner.
+but is not a complete system to take down a multithreaded program in an
+orderly manner, nor even necessarily a part of one.
 
 Most functions which are configuration-specific are `@compileError`s to
-call when not so configured. `release()` is always allowed, and will set
-the handle pointer to `undefined` (for modes where this has an effect)
-in all cases.
+call when not so configured. `release()` is always allowed, and will
+set the handle pointer to `undefined` (for modes where this has an
+effect) in all cases.  Its use is recommended whenever a `WriteHandle`
+is disposed, as documentation if nothing else.
 
 In addition to the already-illustrated value and slice writes, a
 `WriteHandle` has `enqueueSliceUpTo`.  This is passed a slice, and
@@ -205,8 +212,8 @@ requested slice, then write to it and perform a `commit()`:
 
 ```zig
 if (wh.reserveSlice(12)) |slice| {
+    defer wh.commit();
     @memcpy(slice, "Hello there!");
-    wh.commit();
 } else |_| {
     // Not enough room, it's fine, I didn't
     // even want to say hello... baka
@@ -217,7 +224,7 @@ It is asserted that any given `WriteHandle` will not open another
 reservation until the last one is committed.
 
 Accomplishing the commit uses some space on the `WriteHandle`, and as
-such, the reader-side cannot call this function directly.  It's cheap to
+such, the reader side cannot call this function directly.  It's cheap to
 create a `WriteHandle` (`defer wh.release()`!) and use it, in the event
 that the reader needs to do this kind of thing itself.
 
@@ -297,7 +304,7 @@ buy you some flexibility, but the governing equation is as simple as it
 is stern.
 
 A `TuQueQue` queque is quite well-suited to SPSC work, which is after
-all just a special case of MPSC where `M == 1`.  Just don't rely on the
+all just a special case of MPSC where `M == S`.  Just don't rely on the
 built-in `Notifier`s alone, it takes more than that to avoid deadlock
 races[^✤].  If you're certain the workload will be SPSC, it may be
 that something more specialized to that purpose will suit your needs
@@ -316,13 +323,14 @@ of a cache line, this will work.
 On some ARM systems (not Apple ones) the padding needed for effective
 CAS operations is larger than the cache line.  This can be configured
 with the build option `custom_alignment`.  Search string: "exclusive
-reservation granule".  While we're on the subject: it would be
-surprising if this library functioned correctly on 32-bit systems.
+reservation granule".  While we're on the subject: this library requires
+a CPU capable of atomic operations on 64 bits.  The Zig compiler might
+enforce this but I haven't tried it.
 
 There are a whole host of queries included, answering questions about
 capacity, messages available, and so on.  These are intended primarily
 as debugging aids, also useful for orderly startup and shutdown.  Using
-them in-flight produces read contention on critical atomic values, and
+them in-flight produces read pressure on critical atomic values, and
 the right way to find out how many messages you can get is to dequeue
 them.  It's no great challenge to track the capacity of the queue halves
 locally, detect the case of most or all of it getting used, then employ
@@ -333,7 +341,7 @@ Just, think of it this way: if you grow a queue to catch more writes,
 that's debt.  The reader already has more than it can handle, more
 or less by definition, and if that keeps up, the queue will just
 keep growing, and things will go pear-shaped in the fulness of time.
-Consider making `QueueIsFull` errors a writer-side problem to deal with.
+Consider making `QueueIsFull` errors a write-side problem to deal with.
 
 [^†]: Like the cognitive fallacy.  Pronounced _tu-**kyu**-kway_, if
 possible.  You can also say _¿Tu que que?_, but you had better know who
@@ -360,6 +368,7 @@ case from `error.QueueIsFull`.  Corollary: if you're not sure, use
 not coroutines!
 
 [^✽]: Resizes get exactly what they ask for, for sane book-keeping.
-Just know that rounding up to the cache-line boundary is free, in that
-any sane allocator will round the allocation at least to the alignment,
-so the slice you get back may as well access the full allocation.
+A test build will do likewise for the same reason.  Just know that
+rounding up to the cache-line boundary is free, in that any sane
+allocator will round the allocation at least to the alignment, so the
+slice you get back may as well access the full allocation.

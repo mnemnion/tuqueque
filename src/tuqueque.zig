@@ -607,6 +607,13 @@ pub fn TuQueQue(
             defer q.dequeuing.store(the_dequeue, .monotonic);
             if (the_dequeue.length_remaining > 0) return DequeueError.DequeueNotEmpty;
             const dq_offset = if (the_dequeue.index == 0) q0_offset else q1_offset;
+            // NOTE: It is a deliberate decision not to switch back to the
+            // pre-allocation if a shrink would fit inside it.  If you ask a
+            // typical allocator to make a slice smaller, it simply updates
+            // your pointer for you.  This prevents "shimmering" if queues are
+            // repeatedly grown and shrunk between two sizes, we want that to
+            // amortize to 1 allocation, not n.  The case where the original
+            // slice is made smaller is not considered important.
             if (@intFromPtr(q.queues[the_dequeue.index].ptr) == @intFromPtr(q) + dq_offset) {
                 q.queues[the_dequeue.index] = try allocator.alignedAlloc(Cell, cache_align, new_size);
             } else {
