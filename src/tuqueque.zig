@@ -127,27 +127,38 @@
 //| tracking partial draining and other things like that.  That logic is not
 //| 100% transparent to me yet.
 
-/// A Mutex and associated Condition.  This has value semantics,
-/// copies will do the same thing as the original.
+/// A mutex-sequenced notification primitive backed by `std.Io` futex operations.
+/// Share a pointer to one Notifier; copies have independent notification state.
 pub const Notifier = struct {
-    mut: Mutex,
-    cond: Condition,
+    io: std.Io,
+    mut: Mutex = .init,
+    state: Atom(u32) = .init(0),
+    epoch: Atom(u32) = .init(0),
 
-    pub fn new() Notifier {
-        return .{ .mut = .{}, .cond = .{} };
+    const one_waiter = 1;
+    const waiter_mask = 0xffff;
+    const one_signal = 1 << 16;
+    const signal_mask = 0xffff << 16;
+
+    const Wake = enum {
+        one,
+        all,
+    };
+
+    pub fn new(io: std.Io) Notifier {
+        return .{ .io = io };
     }
 
     pub fn sequence(note: *Notifier) void {
-        note.mut.lock();
-        note.mut.unlock();
+        note.mut.lockUncancelable(note.io);
+        note.mut.unlock(note.io);
     }
 
     /// Notify any waiters that it's their turn.
     pub fn notify(note: *Notifier) void {
         // Sequence the mutex:
-        note.mut.lock();
-        note.mut.unlock();
-        note.cond.signal();
+        note.sequence();
+        note.wake(.one);
     }
 
     /// To be on the safe side, this is called whenever
@@ -155,30 +166,104 @@ pub const Notifier = struct {
     /// token for multiple writers.
     pub fn notifyAll(note: *Notifier) void {
         // Sequence the mutex:
-        note.mut.lock();
-        note.mut.unlock();
-        note.cond.broadcast();
+        note.sequence();
+        note.wake(.all);
     }
 
     /// Await a notification.
     pub fn wait(note: *Notifier) void {
         // Acquire the mutex:
-        note.mut.lock();
+        note.mut.lockUncancelable(note.io);
         // Drop it again when we return:
-        defer note.mut.unlock();
+        defer note.mut.unlock(note.io);
         // Drop and wait
-        note.cond.wait(&note.mut);
+        note.waitInner(.none);
     }
 
     /// Await a notification for more-or-less `timeout_ns`.  When
     /// the thread actually awakens is out of our hands.
     pub fn timedWait(note: *Notifier, timeout_ns: usize) void {
         // Acquire the mutex:
-        note.mut.lock();
+        note.mut.lockUncancelable(note.io);
         // Drop it again when we return:
-        defer note.mut.unlock();
+        defer note.mut.unlock(note.io);
         // Drop and wait for signal or timeout
-        note.cond.timedWait(&note.mut, timeout_ns) catch {};
+        note.waitInner(.{ .duration = .{
+            .raw = .fromNanoseconds(@intCast(timeout_ns)),
+            .clock = .awake,
+        } });
+    }
+
+    fn waitInner(note: *Notifier, timeout: std.Io.Timeout) void {
+        const old_cancel_protection = note.io.swapCancelProtection(.blocked);
+        defer _ = note.io.swapCancelProtection(old_cancel_protection);
+
+        const observed_epoch = note.epoch.load(.acquire);
+        var state = note.state.fetchAdd(one_waiter, .monotonic);
+        assert(state & waiter_mask != waiter_mask);
+        state += one_waiter;
+
+        note.mut.unlock(note.io);
+        defer note.mut.lockUncancelable(note.io);
+
+        switch (timeout.toDeadline(note.io)) {
+            .none => note.io.futexWaitUncancelable(u32, &note.epoch.raw, observed_epoch),
+            else => |deadline| note.io.futexWaitTimeout(
+                u32,
+                &note.epoch.raw,
+                observed_epoch,
+                deadline,
+            ) catch |err| switch (err) {
+                error.Canceled => unreachable,
+            },
+        }
+
+        state = note.state.load(.monotonic);
+        while (true) {
+            while (state & signal_mask != 0) {
+                const new_state = state - one_waiter - one_signal;
+                state = note.state.cmpxchgWeak(
+                    state,
+                    new_state,
+                    .acquire,
+                    .monotonic,
+                ) orelse return;
+            }
+
+            const new_state = state - one_waiter;
+            state = note.state.cmpxchgWeak(
+                state,
+                new_state,
+                .monotonic,
+                .monotonic,
+            ) orelse return;
+        }
+    }
+
+    fn wake(note: *Notifier, comptime wake_kind: Wake) void {
+        var state = note.state.load(.monotonic);
+        while (true) {
+            const waiters = (state & waiter_mask) / one_waiter;
+            const signals = (state & signal_mask) / one_signal;
+            const wakeable = waiters - signals;
+            if (wakeable == 0) return;
+
+            const to_wake = switch (wake_kind) {
+                .one => 1,
+                .all => wakeable,
+            };
+            const new_state = state + one_signal * to_wake;
+            state = note.state.cmpxchgWeak(
+                state,
+                new_state,
+                .release,
+                .monotonic,
+            ) orelse {
+                _ = note.epoch.fetchAdd(1, .release);
+                note.io.futexWake(u32, &note.epoch.raw, to_wake);
+                return;
+            };
+        }
     }
 };
 
@@ -328,8 +413,9 @@ pub fn TuQueQue(
         //| be thrown if the invariant is violated in a detectable manner.
 
         /// Create a new swap-buffer queue.  The queue returned will be closed
-        /// for writes.  Destroy when finished with `q.destroy(allocator)`.
-        pub fn create(allocator: Allocator) Allocator.Error!*align(cache_line) Queue {
+        /// for writes.  `io` is retained by any configured notifiers.  Destroy
+        /// when finished with `q.destroy(allocator)`.
+        pub fn create(io: std.Io, allocator: Allocator) Allocator.Error!*align(cache_line) Queue {
             var q_raw = try allocator.alignedAlloc(u8, cache_align, bytes_total);
             var q: *align(cache_line) Queue = @ptrCast(@alignCast(q_raw));
             errdefer allocator.free(q_raw);
@@ -338,8 +424,8 @@ pub fn TuQueQue(
             q.dequeuing.raw = DequeueToken.new();
             q.lengths[0].raw = 0;
             q.lengths[1].raw = 0;
-            q.reader_notify = if (reader_notified) Notifier.new() else {};
-            q.writer_notify = if (writer_notified) Notifier.new() else {};
+            q.reader_notify = if (reader_notified) Notifier.new(io) else {};
+            q.writer_notify = if (writer_notified) Notifier.new(io) else {};
             q.writer_refs = if (refcounted) .{ .raw = 0 } else {};
             const queue_0_raw = q_raw[@sizeOf(Queue)..][0 .. start_cap * @sizeOf(Cell)];
             q.queues[0] = std.mem.bytesAsSlice(Cell, queue_0_raw);
@@ -750,7 +836,7 @@ pub fn TuQueQue(
             /// obtaining it from the WriteHandle is made possible.  Note that
             /// this is a compile error to call if write notification is not
             /// enabled for this queue type.
-            pub fn writeNotifier(wh: *WriteHandle) Notifier {
+            pub fn writeNotifier(wh: *WriteHandle) *Notifier {
                 const q: *Queue = @ptrCast(@alignCast(wh.ptr));
                 return q.writeNotifier();
             }
@@ -947,7 +1033,7 @@ pub fn TuQueQue(
             const stored_dequeue: DequeueToken = .{ .index = index, .length_remaining = length_expected };
             q.dequeuing.store(stored_dequeue, .monotonic);
 
-            return DequeueError.DequeuePending;
+            return error.DequeuePending;
         }
 
         fn commitEnqueue(q: *Queue, slots: u62, index: u1) void {
@@ -1281,7 +1367,7 @@ test "pointer casting" {
 
 test "queue basics" {
     const EzQ = TuQueQue(u8, 128, .{ .notify = .neither, .refcount = false });
-    var new_q = try EzQ.create(talloc);
+    var new_q = try EzQ.create(std.testing.io, talloc);
     defer new_q.destroy(talloc);
     const heyyy = "hello world";
     new_q.open();
@@ -1298,7 +1384,7 @@ test "queue basics" {
 
 test "queue full" {
     const SmolQ = TuQueQue(u8, 6, .{ .notify = .neither, .refcount = false });
-    var new_q = try SmolQ.create(talloc);
+    var new_q = try SmolQ.create(std.testing.io, talloc);
     defer new_q.destroy(talloc);
     new_q.open();
     defer new_q.close();
@@ -1319,7 +1405,7 @@ test "queue full" {
 
 test "WriteHandle" {
     const SmolQ = TuQueQue(u8, 6, .{ .notify = .neither, .refcount = true });
-    var q = try SmolQ.create(talloc);
+    var q = try SmolQ.create(std.testing.io, talloc);
     var danger_zone = true;
     defer {
         if (danger_zone) {
@@ -1574,14 +1660,14 @@ fn threadSmokeTests(
 
     var prng = std.Random.DefaultPrng.init(blk: {
         var seed: u64 = undefined;
-        try std.posix.getrandom(std.mem.asBytes(&seed));
+        std.testing.io.random(std.mem.asBytes(&seed));
         break :blk seed;
     });
     const rand = prng.random();
 
     var danger_zone: bool = true;
     var knockers: [thread_count]KnockKnock = undefined;
-    const q = try Q64.create(talloc);
+    const q = try Q64.create(std.testing.io, talloc);
     defer {
         if (danger_zone) {
             q.errDestroy(talloc); // no-coverage
@@ -1719,7 +1805,7 @@ fn producerConsumer(queue_cap: comptime_int, stride: comptime_int) !void {
         }
     };
 
-    var q = try PcQ.create(talloc);
+    var q = try PcQ.create(std.testing.io, talloc);
     var danger_zone = true;
     defer {
         if (danger_zone) {
@@ -1730,7 +1816,8 @@ fn producerConsumer(queue_cap: comptime_int, stride: comptime_int) !void {
     }
     q.open();
     var read: Reader = .{ .q = q };
-    var write: Writer = .{ .wh = q.writeHandle(), .w_note = q.writeNotifier() };
+    var write_handle = q.writeHandle();
+    var write: Writer = .{ .wh = write_handle, .w_note = write_handle.writeNotifier() };
     var r_thread = try Thread.spawn(.{ .stack_size = 1024 * 128 }, Reader.run, .{ &read, &buf });
     var w_thread = try Thread.spawn(.{ .stack_size = 1024 * 128 }, Writer.run, .{&write});
     r_thread.join();
@@ -1783,7 +1870,7 @@ fn waitSlam(threads: comptime_int, capacity: comptime_int, count: comptime_int) 
             }
         }
     };
-    var slammer: Slammed = .{ .q = try QSlam.create(talloc) };
+    var slammer: Slammed = .{ .q = try QSlam.create(std.testing.io, talloc) };
     slammer.q.open();
     var danger_zone = true;
     defer {
@@ -1821,7 +1908,7 @@ test waitSlam {
 fn allocTest(allocator: Allocator) !void {
     // TODO: re-allocate the queues
     const SmolQ = TuQueQue(u8, 6, .{ .notify = .neither, .refcount = false });
-    var new_q = try SmolQ.create(allocator);
+    var new_q = try SmolQ.create(std.testing.io, allocator);
     defer new_q.errDestroy(allocator);
     new_q.open();
     const dummy = try allocator.create(usize);
@@ -1868,9 +1955,17 @@ const spinLoopHint = std.atomic.spinLoopHint;
 const Atom = std.atomic.Value; // I prefer it ¯\_(ツ)_/¯
 
 const Thread = std.Thread;
-const Condition = Thread.Condition;
-const Mutex = Thread.Mutex;
-const sleep = Thread.sleep;
+const Mutex = std.Io.Mutex;
+
+fn sleep(timeout_ns: usize) void {
+    std.Io.sleep(
+        std.testing.io,
+        .fromNanoseconds(@intCast(timeout_ns)),
+        .awake,
+    ) catch |err| switch (err) {
+        error.Canceled => unreachable,
+    };
+}
 
 const testing = std.testing;
 const expect = testing.expect;
