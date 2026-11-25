@@ -59,7 +59,7 @@ with no benchmarks.
 `TuQueQue` requires Zig `0.15.2`.
 
 ```sh
-zig fetch --save "https://github.com/mnemnion/tuqueque/archive/refs/tags/v0.0.1.tar.gz"
+zig fetch --save "https://github.com/mnemnion/tuqueque/archive/refs/tags/v0.0.2.tar.gz"
 ```
 
 ## Use
