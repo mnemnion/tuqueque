@@ -1304,7 +1304,7 @@ inline fn order(a: anytype, b: anytype) Order {
 // The 15.2 version of compare is inefficient.  This produces
 // optimal code, and you can see why.
 inline fn compare(a: anytype, cmp: Compare, b: anytype) bool {
-    const ord = @intFromEnum(order(a, b));
+    const ord = @backingInt(order(a, b));
     return switch (cmp) {
         .lt => ord < 0,
         .lte => ord <= 0,
@@ -1718,12 +1718,14 @@ test "smoke tests" {
     try threadSmokeTests(128, 8, "accumulate");
 }
 
-const fortuna =
+const fortuna_unit =
     \\We the unwilling, led by the ungrateful, are doing the impossible.
     \\We've done so much, for so long, with so little,
     \\that we are now qualified to do something with nothing.
     \\
-** 10;
+;
+const fortuna_repeated: [10][fortuna_unit.len]u8 = @splat(fortuna_unit.*);
+const fortuna = std.mem.asBytes(&fortuna_repeated);
 
 fn producerConsumer(queue_cap: comptime_int, stride: comptime_int) !void {
     if (stride > queue_cap * 2) @compileError("stride must fit in half queue");
@@ -1940,8 +1942,8 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 
 const builtin = @import("builtin");
-const is_debug = builtin.mode == .Debug;
-const is_safe = is_debug or builtin.mode == .ReleaseSafe;
+const is_debug = builtin.mode == .debug;
+const is_safe = is_debug or builtin.mode == .safe;
 const is_test = builtin.is_test;
 
 const options = @import("options");
